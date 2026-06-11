@@ -2682,7 +2682,38 @@ void NotificationManager::render_notifications(GLCanvas3D &canvas, float overlay
         close_and_delete_self(m_to_delete_after_finish_render);
         m_to_delete_after_finish_render = nullptr;
     }
+	// Personal: re-show the auto-hidden object-info box when the mouse enters its corner.
+	maybe_reshow_object_info(canvas);
 	m_last_render = GLCanvas3D::timestamp_now();
+}
+
+void NotificationManager::maybe_reshow_object_info(GLCanvas3D &canvas)
+{
+	if (!m_has_object_info)
+		return;
+	auto *app_config = wxGetApp().app_config;
+	if (!app_config || app_config->get("auto_hide_object_info") != "true")
+		return;
+
+	// If the object-info box is still on screen, nothing to do (its own hover-keep applies).
+	for (const auto &n : m_pop_notifications) {
+		if (n->get_type() == NotificationType::BBLObjectInfo
+			&& n->get_state() != PopNotification::EState::Finished
+			&& n->get_state() != PopNotification::EState::Hidden)
+			return;
+	}
+
+	// Re-show when the mouse is in the bottom-right corner where the box lives.
+	const Size   cnv = canvas.get_canvas_size();
+	const ImVec2 m   = ImGui::GetMousePos();
+	const float  w   = (float) cnv.get_width();
+	const float  h   = (float) cnv.get_height();
+	const float  hot_w = 360.0f * m_scale;
+	const float  hot_h = 220.0f * m_scale;
+	if (m.x >= w - hot_w && m.x <= w && m.y >= h - hot_h && m.y <= h) {
+		bbl_show_objectsinfo_notification(m_object_info_text, m_object_info_is_warning, false,
+										  m_object_info_hypertext, m_object_info_callback);
+	}
 }
 
 bool NotificationManager::update_notifications(GLCanvas3D& canvas)
@@ -2935,9 +2966,27 @@ void NotificationManager::bbl_close_preview_only_notification()
 
 void NotificationManager::bbl_show_objectsinfo_notification(const std::string &text, bool is_warning, bool is_hidden, const std::string hypertext, std::function<bool(wxEvtHandler*)> callback)
 {
-    NotificationData data{NotificationType::BBLObjectInfo, NotificationLevel::PrintInfoNotificationLevel, BBL_NOTICE_MAX_INTERVAL, text, hypertext, callback};
+    // Personal: optionally auto-hide the object-info box after a user-set delay
+    // (Preferences -> "Auto-hide object info box"). Default off = original 10-day "never".
+    int object_info_duration = BBL_NOTICE_MAX_INTERVAL;
+    if (auto *app_config = wxGetApp().app_config) {
+        if (app_config->get("auto_hide_object_info") == "true") {
+            int secs = 20;
+            const std::string s = app_config->get("object_info_hide_seconds");
+            if (!s.empty()) { try { secs = std::stoi(s); } catch (...) { secs = 20; } }
+            if (secs > 0) object_info_duration = secs;
+        }
+    }
+    NotificationData data{NotificationType::BBLObjectInfo, NotificationLevel::PrintInfoNotificationLevel, object_info_duration, text, hypertext, callback};
     if (is_warning)
         data.use_warn_color = true;
+
+    // Personal: remember this object info so the corner hotspot can re-show it after auto-hide.
+    m_object_info_text       = text;
+    m_object_info_hypertext  = hypertext;
+    m_object_info_is_warning = is_warning;
+    m_object_info_callback   = callback;
+    m_has_object_info        = true;
 
     for (auto it = m_pop_notifications.begin(); it != m_pop_notifications.end();) {
         std::unique_ptr<PopNotification>& notification = *it;
@@ -2958,6 +3007,8 @@ void NotificationManager::bbl_show_objectsinfo_notification(const std::string &t
 
 void NotificationManager::bbl_close_objectsinfo_notification()
 {
+    // Personal: selection cleared -> forget the stored info so the corner hotspot won't re-show it.
+    m_has_object_info = false;
     for (std::unique_ptr<PopNotification> &notification : m_pop_notifications)
         if (notification->get_type() == NotificationType::BBLObjectInfo) { notification->close(); }
 }

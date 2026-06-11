@@ -1331,6 +1331,10 @@ wxWindow* PreferencesDialog::create_general_page()
     auto item_beta_version_update = create_item_checkbox(_L("Support beta version update."), page, _L("With this option enabled, you can receive beta version updates."), 50, "enable_beta_version_update");
     auto item_mix_print_high_low_temperature = create_item_checkbox(_L("Remove the restriction on mixed printing of high and low temperature filaments."), page, _L("With this option enabled, you can print materials with a large temperature difference together."), 50, "enable_high_low_temp_mixed_printing");
     auto item_camera_fullscreen_active_monitor_only = create_item_checkbox(_L("Open full screen camera view on active monitor only."), page, _L("When enabled, the camera full screen view opens only on the monitor that contains Bambu Studio."), 50, "camera_fullscreen_active_monitor_only");
+    auto item_auto_hide_object_info = create_item_checkbox(_L("Auto-hide object info box"), page,
+        _L("Fade out the object info box in the 3D view after a delay. Default off."), 50, "auto_hide_object_info");
+    auto item_object_info_hide_seconds = create_item_input(_L("Object info auto-hide delay"), _L("s"), page,
+        _L("Seconds before the object info box auto-hides (default 20)."), "object_info_hide_seconds", [](wxString) {});
     auto item_restore_hide_pop_ups = create_item_button(_L("Clear my choice for synchronizing printer preset after loading the file."), _L("Clear"), page, {}, []() {
         wxGetApp().app_config->erase("app", "sync_after_load_file_show_flag");
     });
@@ -1507,6 +1511,8 @@ wxWindow* PreferencesDialog::create_general_page()
     sizer_page->Add(item_auto_transfer_when_switch_preset, 0, wxTOP, FromDIP(3));
     sizer_page->Add(item_mix_print_high_low_temperature, 0, wxTOP, FromDIP(3));
     sizer_page->Add(item_camera_fullscreen_active_monitor_only, 0, wxTOP, FromDIP(3));
+    sizer_page->Add(item_auto_hide_object_info, 0, wxTOP, FromDIP(3));
+    sizer_page->Add(item_object_info_hide_seconds, 0, wxTOP, FromDIP(3));
     sizer_page->Add(item_restore_hide_pop_ups, 0, wxTOP, FromDIP(3));
     sizer_page->Add(item_restore_hide_3mf_info, 0, wxTOP, FromDIP(3));
     sizer_page->Add(item_restore_support_recommend_dlg, 0, wxTOP, FromDIP(3));

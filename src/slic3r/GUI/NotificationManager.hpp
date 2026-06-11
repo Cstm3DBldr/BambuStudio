@@ -882,6 +882,14 @@ private:
 	NotificationIDProvider 		 m_id_provider;
 	std::deque<std::unique_ptr<PopNotification>> m_pop_notifications;
     PopNotification* m_to_delete_after_finish_render{nullptr};
+	// Personal: remember the last object-info push so it can be re-shown when the
+	// mouse enters its corner after it auto-hides.
+	std::string                  m_object_info_text;
+	std::string                  m_object_info_hypertext;
+	bool                         m_object_info_is_warning { false };
+	std::function<bool(wxEvtHandler*)> m_object_info_callback;
+	bool                         m_has_object_info { false };
+	void maybe_reshow_object_info(GLCanvas3D &canvas);
 	// delayed waiting notifications, first is remaining time
 	std::vector<DelayedNotification> m_waiting_notifications;
 	//timestamps used for slicing finished - notification could be gone so it needs to be stored here
