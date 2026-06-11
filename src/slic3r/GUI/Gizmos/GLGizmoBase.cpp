@@ -473,6 +473,8 @@ bool GLGizmoBase::update_items_state()
 
 bool GLGizmoBase::GizmoImguiBegin(const std::string &name, int flags)
 {
+    // Personal: allow tool windows to be dragged by stripping the pinned/no-move flag.
+    flags &= ~ImGuiWindowFlags_NoMove;
     return m_imgui->begin(name, flags);
 }
 
@@ -484,6 +486,8 @@ void GLGizmoBase::GizmoImguiEnd()
 
 void GLGizmoBase::GizmoImguiSetNextWIndowPos(float &x, float y, int flag, float pivot_x, float pivot_y)
 {
+    // Personal: place the window on first appearance only, then keep the user's dragged position.
+    flag = ImGuiCond_FirstUseEver;
     if (abs(last_input_window_width) > 0.01f) {
         if (x + last_input_window_width > m_parent.get_canvas_size().get_width()) {
             if (last_input_window_width > m_parent.get_canvas_size().get_width()) {
