@@ -2744,9 +2744,21 @@ ModelObjectPtrs ModelObject::merge_volumes(std::vector<int>& vol_indeces)
 
 #if 1
     TriangleMesh mesh;
+    // BBS: preserve painting across the merge. its_merge() appends faces in
+    // order (only vertex indices are offset), so face f of the merged mesh maps
+    // exactly to the captured per-part triangles below. Capture before
+    // reset_mesh() empties the source volumes.
+    std::vector<std::string> merged_supported, merged_seam, merged_mmu, merged_fuzzy;
     for (int i : vol_indeces) {
         auto volume = volumes[i];
         if (!volume->mesh().empty()) {
+            const size_t nf = volume->mesh().its.indices.size();
+            for (size_t f = 0; f < nf; ++f) {
+                merged_supported.emplace_back(volume->supported_facets.get_triangle_as_string((int)f));
+                merged_seam.emplace_back(volume->seam_facets.get_triangle_as_string((int)f));
+                merged_mmu.emplace_back(volume->mmu_segmentation_facets.get_triangle_as_string((int)f));
+                merged_fuzzy.emplace_back(volume->fuzzy_skin_facets.get_triangle_as_string((int)f));
+            }
             const auto volume_matrix = volume->get_matrix();
             TriangleMesh mesh_(volume->mesh());
             mesh_.transform(volume_matrix, true);
@@ -2766,6 +2778,13 @@ ModelObjectPtrs ModelObject::merge_volumes(std::vector<int>& vol_indeces)
 #endif
 
     ModelVolume* vol = upper->add_volume(mesh);
+    // BBS: re-apply the painting captured above onto the merged volume.
+    for (size_t f = 0; f < merged_mmu.size() && f < mesh.its.indices.size(); ++f) {
+        if (!merged_supported[f].empty()) vol->supported_facets.set_triangle_from_string((int)f, merged_supported[f]);
+        if (!merged_seam[f].empty())      vol->seam_facets.set_triangle_from_string((int)f, merged_seam[f]);
+        if (!merged_mmu[f].empty())       vol->mmu_segmentation_facets.set_triangle_from_string((int)f, merged_mmu[f]);
+        if (!merged_fuzzy[f].empty())     vol->fuzzy_skin_facets.set_triangle_from_string((int)f, merged_fuzzy[f]);
+    }
     for (int i = 0; i < volumes.size();i++) {
         if (std::find(vol_indeces.begin(), vol_indeces.end(), i) != vol_indeces.end()) {
             vol->name = "Merged Parts";
@@ -3449,10 +3468,19 @@ size_t ModelVolume::split(unsigned int max_extruders, float scale_det)
     unsigned int extruder_counter = 0;
     const Vec3d offset = this->get_offset();
     std::vector<std::string> tris_split_strs;
+    // BBS: also carry support/seam/fuzzy-skin painting across the split (the
+    // ships[] relationship maps each split face back to its source face).
+    std::vector<std::string> tris_sup_strs, tris_seam_strs, tris_fuzzy_strs;
     auto face_count = m_mesh->its.indices.size();
     tris_split_strs.reserve(face_count);
+    tris_sup_strs.reserve(face_count);
+    tris_seam_strs.reserve(face_count);
+    tris_fuzzy_strs.reserve(face_count);
     for (size_t i = 0; i < face_count; i++) {
         tris_split_strs.emplace_back(mmu_segmentation_facets.get_triangle_as_string(i));
+        tris_sup_strs.emplace_back(supported_facets.get_triangle_as_string(i));
+        tris_seam_strs.emplace_back(seam_facets.get_triangle_as_string(i));
+        tris_fuzzy_strs.emplace_back(fuzzy_skin_facets.get_triangle_as_string(i));
     }
     int last_all_mesh_face_count = 0;
     for (TriangleMesh &mesh : meshes) {
@@ -3478,9 +3506,14 @@ size_t ModelVolume::split(unsigned int max_extruders, float scale_det)
             for (size_t i = 0; i < cur_face_count; i++) {
                 if (ships[idx].find(i) != ships[idx].end()) {
                     auto index = ships[idx][i];
-                    if (tris_split_strs[index].size() > 0) {
+                    if (tris_split_strs[index].size() > 0)
                         mmu_segmentation_facets.set_triangle_from_string(i, tris_split_strs[index]);
-                    }
+                    if (tris_sup_strs[index].size() > 0)
+                        supported_facets.set_triangle_from_string(i, tris_sup_strs[index]);
+                    if (tris_seam_strs[index].size() > 0)
+                        seam_facets.set_triangle_from_string(i, tris_seam_strs[index]);
+                    if (tris_fuzzy_strs[index].size() > 0)
+                        fuzzy_skin_facets.set_triangle_from_string(i, tris_fuzzy_strs[index]);
                 }
             }
         } else {
@@ -3489,9 +3522,14 @@ size_t ModelVolume::split(unsigned int max_extruders, float scale_det)
             for (size_t i = 0; i < new_mv->mesh_ptr()->its.indices.size(); i++) {
                 if (ships[idx].find(i) != ships[idx].end()) {
                     auto index = ships[idx][i];
-                    if (tris_split_strs[index].size() > 0) {
+                    if (tris_split_strs[index].size() > 0)
                         new_mv->mmu_segmentation_facets.set_triangle_from_string(i, tris_split_strs[index]);
-                    }
+                    if (tris_sup_strs[index].size() > 0)
+                        new_mv->supported_facets.set_triangle_from_string(i, tris_sup_strs[index]);
+                    if (tris_seam_strs[index].size() > 0)
+                        new_mv->seam_facets.set_triangle_from_string(i, tris_seam_strs[index]);
+                    if (tris_fuzzy_strs[index].size() > 0)
+                        new_mv->fuzzy_skin_facets.set_triangle_from_string(i, tris_fuzzy_strs[index]);
                 }
             }
         }
