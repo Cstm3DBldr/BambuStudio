@@ -53,13 +53,13 @@ void GLGizmoFaceDetector::on_render_input_window(float x, float y, float bottom_
     y = std::min(y, bottom_limit - approx_height);
     //BBS: GUI refactor: move gizmo to the right
 #if BBS_TOOLBAR_ON_TOP
-    m_imgui->set_next_window_pos(x, y, ImGuiCond_Always, 0.5f, 0.0f);
+    m_imgui->set_next_window_pos(x, y, ImGuiCond_FirstUseEver, 0.5f, 0.0f);
 #else
-    m_imgui->set_next_window_pos(x, y, ImGuiCond_Always, 1.0f, 0.0f);
+    m_imgui->set_next_window_pos(x, y, ImGuiCond_FirstUseEver, 1.0f, 0.0f);
 #endif
 
     ImGuiWrapper::push_toolbar_style();
-    m_imgui->begin(on_get_name(), ImGuiWindowFlags_NoMove | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoCollapse);
+    m_imgui->begin(on_get_name(), ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoCollapse);
 
     ImGui::PushItemWidth(m_imgui->get_style_scaling() * 150);
     ImGui::InputDouble("Sample interval", &m_sample_interval, 0.0f, 0.0f, "%.2f");

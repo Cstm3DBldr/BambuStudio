@@ -169,10 +169,10 @@ const ImVec4 ImGuiWrapper::COL_WINDOW_BG_DARK    = { 45 / 255.f, 45 / 255.f, 49 
 const ImVec4 ImGuiWrapper::COL_BAMBU             = {0.0f, 174.0 / 255.0f, 66.0f / 255, 1.0f};
 const ImVec4 ImGuiWrapper::COL_BAMBU_CHANGE      = {1.0f, 111.0 / 255.0f, 0.0f / 255, 1.0f};
 int ImGuiWrapper::TOOLBAR_WINDOW_FLAGS = ImGuiWindowFlags_AlwaysAutoResize
-                                 | ImGuiWindowFlags_NoMove
                                  | ImGuiWindowFlags_NoResize
                                  | ImGuiWindowFlags_NoCollapse
                                  | ImGuiWindowFlags_NoTitleBar;
+int ImGuiWrapper::s_reset_tool_window_positions = 0;
 
 
 bool get_data_from_svg(const std::string &filename, unsigned int max_size_px, ThumbnailData &thumbnail_data)
@@ -522,6 +522,18 @@ void ImGuiWrapper::new_frame()
 
     ImGuiIO& io = ImGui::GetIO();
 
+    // Personal: enable cross-restart persistence of tool/gizmo window positions.
+    // Done lazily here (not in the ctor) so data_dir() is available; from now on ImGui
+    // auto-saves window layout to this .ini whenever a window moves.
+    if (!m_layout_persist_inited) {
+        m_layout_persist_inited = true;
+        m_ini_path = Slic3r::data_dir() + "/imgui_layout.ini";
+        io.IniFilename = m_ini_path.c_str();
+        ImGui::LoadIniSettingsFromDisk(io.IniFilename);
+    }
+    if (s_reset_tool_window_positions > 0)
+        --s_reset_tool_window_positions;
+
     ImGui::NewFrame();
     m_new_frame_open = true;
 
@@ -630,8 +642,20 @@ float ImGuiWrapper::get_slider_float_height() const
 
 void ImGuiWrapper::set_next_window_pos(float x, float y, int flag, float pivot_x, float pivot_y)
 {
+    // Personal: while a reset is in progress, force tool windows back to their anchor.
+    if (s_reset_tool_window_positions > 0)
+        flag = ImGuiCond_Always;
     ImGui::SetNextWindowPos(ImVec2(x, y), (ImGuiCond)flag, ImVec2(pivot_x, pivot_y));
     ImGui::SetNextWindowSize(ImVec2(0.0, 0.0));
+}
+
+void ImGuiWrapper::request_reset_tool_window_positions()
+{
+    // Snap windows to their default anchor for a few frames, and drop the saved layout
+    // so the reset also sticks across the next restart.
+    s_reset_tool_window_positions = 4;
+    if (!m_ini_path.empty())
+        std::remove(m_ini_path.c_str());
 }
 
 void ImGuiWrapper::set_next_window_bg_alpha(float alpha)

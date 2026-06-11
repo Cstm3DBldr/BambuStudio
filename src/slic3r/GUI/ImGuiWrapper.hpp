@@ -63,6 +63,9 @@ class ImGuiWrapper
 #endif // ENABLE_ENHANCED_IMGUI_SLIDER_FLOAT
     std::map<wchar_t, int> m_custom_glyph_rects_ids;
     std::string m_clipboard_text;
+    // Personal: persist tool/gizmo window positions across restarts via an ImGui .ini in the data dir.
+    bool        m_layout_persist_inited{ false };
+    std::string m_ini_path;
 
 public:
     struct LastSliderStatus {
@@ -379,6 +382,11 @@ public:
     static void pop_radio_style();
     //BBS
     static int TOOLBAR_WINDOW_FLAGS;
+    // Personal: on-canvas reset for tool/gizmo window positions. While > 0, gizmo windows
+    // snap back to their default (Bambu) anchor for a few frames.
+    static int s_reset_tool_window_positions;
+    static bool resetting_tool_windows() { return s_reset_tool_window_positions > 0; }
+    void request_reset_tool_window_positions();
 
 private:
     void init_font(bool compress);

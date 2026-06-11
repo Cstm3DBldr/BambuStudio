@@ -632,12 +632,12 @@ RENDER_AGAIN:
     //ImGui::SetNextWindowPos(ImVec2(x, y - std::max(0.f, y+window_size.y-bottom_limit) ));
     //ImGui::SetNextWindowSize(ImVec2(window_size));
 
-    m_imgui->begin(get_name(), ImGuiWindowFlags_NoMove | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoCollapse);
+    m_imgui->begin(get_name(), ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoCollapse);
 
     // adjust window position to avoid overlap the view toolbar
     float win_h = ImGui::GetWindowHeight();
     y = std::min(y, bottom_limit - win_h);
-    ImGui::SetWindowPos(ImVec2(x, y), ImGuiCond_Always);
+    ImGui::SetWindowPos(ImVec2(x, y), ImGuiWrapper::resetting_tool_windows() ? ImGuiCond_Always : ImGuiCond_FirstUseEver);
     if ((last_h != win_h) || (last_y != y))
     {
         // ask canvas for another frame to render the window in the correct position

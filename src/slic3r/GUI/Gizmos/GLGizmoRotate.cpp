@@ -737,15 +737,14 @@ GLGizmoRotate3D::RotoptimzeWindow::RotoptimzeWindow(ImGuiWrapper *   imgui,
                                                     const Alignment &alignment)
     : m_imgui{imgui}
 {
-    imgui->begin(_L("Optimize orientation"), ImGuiWindowFlags_NoMove |
-                                     ImGuiWindowFlags_AlwaysAutoResize |
+    imgui->begin(_L("Optimize orientation"), ImGuiWindowFlags_AlwaysAutoResize |
                                      ImGuiWindowFlags_NoCollapse);
 
     // adjust window position to avoid overlap the view toolbar
     float win_h = ImGui::GetWindowHeight();
     float x = alignment.x, y = alignment.y;
     y = std::min(y, alignment.bottom_limit - win_h);
-    ImGui::SetWindowPos(ImVec2(x, y), ImGuiCond_Always);
+    ImGui::SetWindowPos(ImVec2(x, y), ImGuiWrapper::resetting_tool_windows() ? ImGuiCond_Always : ImGuiCond_FirstUseEver);
 
     float max_text_w = 0.;
     auto padding = ImGui::GetStyle().FramePadding;

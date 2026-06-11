@@ -1,6 +1,8 @@
 #include "GLGizmoBase.hpp"
 #include "slic3r/GUI/GLCanvas3D.hpp"
 
+#include <cmath>
+
 #include <GL/glew.h>
 
 #include "slic3r/GUI/GUI_App.hpp"
@@ -739,6 +741,56 @@ void GLGizmoBase::render_input_window(float x, float y, float bottom_limit)
         // so, we forces another frame rendering the first time the imgui window is shown
         m_parent.set_as_dirty();
         m_first_input_window_render = false;
+    }
+
+    // Personal: on-canvas "reset tool window positions" button. Visible whenever a tool's
+    // input window is active; one click snaps every tool window back to its Bambu default.
+    {
+        const float scale = (float) m_parent.get_scale();
+        const float bsz   = 30.0f * scale;
+        const float pad   = 14.0f * scale;
+        const float tb_w  = (float) m_parent.get_main_toolbar_width();
+        const float tb_h  = (float) m_parent.get_main_toolbar_height();
+        // Sit just to the right of the (top-center) toolbar, vertically aligned with it.
+        const float bx    = canvas_w * 0.5f + tb_w * 0.5f + 2.0f * pad;
+        const float by    = (tb_h > bsz) ? (tb_h - bsz) * 0.5f : 0.0f;
+        ImGui::SetNextWindowPos(ImVec2(bx, by), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(bsz, bsz), ImGuiCond_Always);
+        ImGui::SetNextWindowBgAlpha(0.30f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+        ImGui::Begin("##reset_tool_windows", nullptr,
+            ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove
+            | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoFocusOnAppearing
+            | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoSavedSettings);
+        const ImVec2 p = ImGui::GetCursorScreenPos();
+        const bool clicked = ImGui::InvisibleButton("##reset_hit", ImVec2(bsz, bsz));
+        const bool hovered = ImGui::IsItemHovered();
+        ImDrawList *dl = ImGui::GetWindowDrawList();
+        const ImVec2 c(p.x + bsz * 0.5f, p.y + bsz * 0.5f);
+        const float  r   = bsz * 0.30f;
+        const ImU32  col = hovered ? IM_COL32(255, 255, 255, 255) : IM_COL32(205, 205, 205, 255);
+        const float  PI  = 3.14159265358979f;
+        const float  a0  = PI * -0.28f;   // gap at the upper-right
+        const float  a1  = PI *  1.45f;
+        dl->PathArcTo(c, r, a0, a1, 24);
+        dl->PathStroke(col, 0, bsz * 0.11f);
+        const ImVec2 sp(c.x + cosf(a0) * r, c.y + sinf(a0) * r); // arrowhead at the arc start
+        const ImVec2 tang(sinf(a0), -cosf(a0));
+        const ImVec2 rad(cosf(a0), sinf(a0));
+        const float  ah = bsz * 0.20f;
+        dl->AddTriangleFilled(
+            ImVec2(sp.x + tang.x * ah,       sp.y + tang.y * ah),
+            ImVec2(sp.x + rad.x * ah * 0.7f, sp.y + rad.y * ah * 0.7f),
+            ImVec2(sp.x - rad.x * ah * 0.7f, sp.y - rad.y * ah * 0.7f),
+            col);
+        ImGui::End();
+        ImGui::PopStyleVar();
+        if (clicked) {
+            m_imgui->request_reset_tool_window_positions();
+            m_parent.request_extra_frame();
+        }
+        if (hovered)
+            m_imgui->tooltip(_u8L("Reset tool window positions").c_str(), ImGui::GetFontSize() * 12.0f);
     }
 }
 

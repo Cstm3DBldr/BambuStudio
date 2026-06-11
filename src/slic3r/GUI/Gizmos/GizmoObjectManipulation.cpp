@@ -838,9 +838,9 @@ void GizmoObjectManipulation::set_init_rotation(const Geometry::Transformation &
         }
     }
 #if BBS_TOOLBAR_ON_TOP
-    imgui_wrapper->set_next_window_pos(x, y, ImGuiCond_Always, 0.f, 0.0f);
+    imgui_wrapper->set_next_window_pos(x, y, ImGuiCond_FirstUseEver, 0.f, 0.0f);
 #else
-    imgui_wrapper->set_next_window_pos(x, y, ImGuiCond_Always, 1.0f, 0.0f);
+    imgui_wrapper->set_next_window_pos(x, y, ImGuiCond_FirstUseEver, 1.0f, 0.0f);
 #endif
 
     // BBS
@@ -1229,9 +1229,9 @@ void GizmoObjectManipulation::do_render_rotate_window(ImGuiWrapper *imgui_wrappe
         }
     }
 #if BBS_TOOLBAR_ON_TOP
-    imgui_wrapper->set_next_window_pos(x, y, ImGuiCond_Always, 0.f, 0.0f);
+    imgui_wrapper->set_next_window_pos(x, y, ImGuiCond_FirstUseEver, 0.f, 0.0f);
 #else
-    imgui_wrapper->set_next_window_pos(x, y, ImGuiCond_Always, 1.0f, 0.0f);
+    imgui_wrapper->set_next_window_pos(x, y, ImGuiCond_FirstUseEver, 1.0f, 0.0f);
 #endif
 
     // BBS
@@ -1429,9 +1429,9 @@ void GizmoObjectManipulation::do_render_scale_input_window(ImGuiWrapper* imgui_w
         }
     }
 #if BBS_TOOLBAR_ON_TOP
-    imgui_wrapper->set_next_window_pos(x, y, ImGuiCond_Always, 0.f, 0.0f);
+    imgui_wrapper->set_next_window_pos(x, y, ImGuiCond_FirstUseEver, 0.f, 0.0f);
 #else
-    imgui_wrapper->set_next_window_pos(x, y, ImGuiCond_Always, 1.0f, 0.0f);
+    imgui_wrapper->set_next_window_pos(x, y, ImGuiCond_FirstUseEver, 1.0f, 0.0f);
 #endif
 
     //BBS
