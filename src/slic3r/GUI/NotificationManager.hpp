@@ -524,6 +524,10 @@ private:
 		virtual bool push_background_color();
 		// used this function instead of reading directly m_data.duration. Some notifications might need to return changing value.
 		virtual int  get_duration() { return m_data.duration; }
+		// Personal: when "auto_hide_errors" is on, error/warning notifications (duration 0 =
+		// never fade) instead fade after 2x the object-info delay and go Hidden (kept for the bell).
+		int  bbl_effective_duration() const;
+		bool bbl_is_autohide_error() const;
         void        ensure_ui_inited();
 		bool m_is_dark = false;
         bool m_is_dark_inited = false;
@@ -889,7 +893,11 @@ private:
 	bool                         m_object_info_is_warning { false };
 	std::function<bool(wxEvtHandler*)> m_object_info_callback;
 	bool                         m_has_object_info { false };
+	bool                         m_info_corner_was_inside { false }; // edge-trigger for corner re-show
 	void maybe_reshow_object_info(GLCanvas3D &canvas);
+	// Personal: a "bell" in the corner showing the count of auto-hidden error/warning
+	// notifications; click to bring them back.
+	void render_error_bell(GLCanvas3D &canvas);
 	// delayed waiting notifications, first is remaining time
 	std::vector<DelayedNotification> m_waiting_notifications;
 	//timestamps used for slicing finished - notification could be gone so it needs to be stored here

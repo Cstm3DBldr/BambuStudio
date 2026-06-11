@@ -1335,6 +1335,8 @@ wxWindow* PreferencesDialog::create_general_page()
         _L("Fade out the object info box in the 3D view after a delay. Default off."), 50, "auto_hide_object_info");
     auto item_object_info_hide_seconds = create_item_input(_L("Object info auto-hide delay"), _L("s"), page,
         _L("Seconds before the object info box auto-hides (default 20)."), "object_info_hide_seconds", [](wxString) {});
+    auto item_auto_hide_errors = create_item_checkbox(_L("Auto-hide error/warning notifications"), page,
+        _L("Fade out error and warning pop-ups after 2x the object-info delay; a bell in the bottom-right corner keeps the count, click it to bring them back. Default off."), 50, "auto_hide_errors");
     auto item_restore_hide_pop_ups = create_item_button(_L("Clear my choice for synchronizing printer preset after loading the file."), _L("Clear"), page, {}, []() {
         wxGetApp().app_config->erase("app", "sync_after_load_file_show_flag");
     });
@@ -1513,6 +1515,7 @@ wxWindow* PreferencesDialog::create_general_page()
     sizer_page->Add(item_camera_fullscreen_active_monitor_only, 0, wxTOP, FromDIP(3));
     sizer_page->Add(item_auto_hide_object_info, 0, wxTOP, FromDIP(3));
     sizer_page->Add(item_object_info_hide_seconds, 0, wxTOP, FromDIP(3));
+    sizer_page->Add(item_auto_hide_errors, 0, wxTOP, FromDIP(3));
     sizer_page->Add(item_restore_hide_pop_ups, 0, wxTOP, FromDIP(3));
     sizer_page->Add(item_restore_hide_3mf_info, 0, wxTOP, FromDIP(3));
     sizer_page->Add(item_restore_support_recommend_dlg, 0, wxTOP, FromDIP(3));

@@ -1078,6 +1078,33 @@ void NotificationManager::PopNotification::hide(bool h)
     m_state = h ? EState::Hidden : EState::Unknown;
 }
 
+bool NotificationManager::PopNotification::bbl_is_autohide_error() const
+{
+	if (auto *cfg = wxGetApp().app_config) {
+		if (cfg->get("auto_hide_errors") == "true") {
+			return m_data.level == NotificationLevel::ErrorNotificationLevel
+				|| m_data.level == NotificationLevel::SeriousWarningNotificationLevel
+				|| m_data.level == NotificationLevel::WarningNotificationLevel;
+		}
+	}
+	return false;
+}
+
+int NotificationManager::PopNotification::bbl_effective_duration() const
+{
+	// Only override the "never fade" (duration 0) errors/warnings when auto-hide is enabled.
+	if (m_data.duration == 0 && bbl_is_autohide_error()) {
+		int info_secs = 20;
+		if (auto *cfg = wxGetApp().app_config) {
+			const std::string s = cfg->get("object_info_hide_seconds");
+			if (!s.empty()) { try { info_secs = std::stoi(s); } catch (...) { info_secs = 20; } }
+		}
+		if (info_secs <= 0) info_secs = 20;
+		return 2 * info_secs; // errors stay twice as long as the info box
+	}
+	return m_data.duration;
+}
+
 bool NotificationManager::PopNotification::update_state(bool paused, const int64_t delta)
 {
 
@@ -1103,13 +1130,14 @@ bool NotificationManager::PopNotification::update_state(bool paused, const int64
 	if (m_state == EState::Hovered) {
 		init();
 	// Timers when not fading
-	} else if (m_state != EState::NotFading && m_state != EState::FadingOut && m_state != EState::ClosePending && m_state != EState::Finished && get_duration() != 0 && !paused) {
+	} else if (m_state != EState::NotFading && m_state != EState::FadingOut && m_state != EState::ClosePending && m_state != EState::Finished && bbl_effective_duration() != 0 && !paused) {
+		const int eff_dur = bbl_effective_duration();
 		int64_t up_time = now - m_notification_start;
-		if (up_time >= get_duration() * 1000) {
+		if (up_time >= eff_dur * 1000) {
 			m_state					= EState::FadingOut;
 			m_fading_start			= now;
 		} else {
-			m_next_render = get_duration() * 1000 - up_time;
+			m_next_render = eff_dur * 1000 - up_time;
 		}
 	}
 	// Timers when fading
@@ -1118,7 +1146,8 @@ bool NotificationManager::PopNotification::update_state(bool paused, const int64
 		int64_t next_render		= FADING_OUT_TIMEOUT - delta;
 		m_current_fade_opacity	= std::clamp(1.0f - 0.001f * static_cast<float>(curr_time) / FADING_OUT_DURATION, 0.0f, 1.0f);
 		if (m_current_fade_opacity <= 0.0f) {
-			m_state = EState::Finished;
+			// Personal: keep auto-hidden errors/warnings around (Hidden) so the bell can recall them.
+			m_state = bbl_is_autohide_error() ? EState::Hidden : EState::Finished;
 			return true;
 		} else if (next_render <= 20) {
 			m_next_render = FADING_OUT_TIMEOUT;
@@ -2684,15 +2713,119 @@ void NotificationManager::render_notifications(GLCanvas3D &canvas, float overlay
     }
 	// Personal: re-show the auto-hidden object-info box when the mouse enters its corner.
 	maybe_reshow_object_info(canvas);
+	// Personal: draw the error/warning "bell" in the corner.
+	render_error_bell(canvas);
 	m_last_render = GLCanvas3D::timestamp_now();
+}
+
+void NotificationManager::render_error_bell(GLCanvas3D &canvas)
+{
+	// The bell only matters when errors auto-hide into it.
+	auto *cfg = wxGetApp().app_config;
+	if (!cfg || cfg->get("auto_hide_errors") != "true")
+		return;
+
+	auto is_alert = [](NotificationLevel lvl) {
+		return lvl == NotificationLevel::ErrorNotificationLevel
+			|| lvl == NotificationLevel::SeriousWarningNotificationLevel
+			|| lvl == NotificationLevel::WarningNotificationLevel;
+	};
+
+	int count = 0;
+	for (const auto &n : m_pop_notifications)
+		if (n->get_state() == PopNotification::EState::Hidden && is_alert(n->get_data().level))
+			++count;
+	if (count == 0)
+		return; // no bell at all when there's nothing hidden
+
+	const Size  cnv = canvas.get_canvas_size();
+	const float pad = 10.0f * m_scale;
+	const float W   = 34.0f * m_scale; // bell drawing box
+	const float H   = 40.0f * m_scale;
+	// Sit bottom-right, but ride up above the object-info box while it is visible, and
+	// drop back down when it hides - so the bell is always reachable.
+	float bell_y = (float) cnv.get_height() - H - pad;
+	for (const auto &n : m_pop_notifications) {
+		if (n->get_type() == NotificationType::BBLObjectInfo
+			&& n->get_state() != PopNotification::EState::Hidden
+			&& n->get_state() != PopNotification::EState::Finished
+			&& n->get_state() != PopNotification::EState::Unknown) {
+			const float info_top_y = (float) cnv.get_height() - n->get_top(); // screen Y of the box's top edge
+			bell_y = info_top_y - H - 6.0f * m_scale;
+			break;
+		}
+	}
+	ImGui::SetNextWindowPos(ImVec2((float) cnv.get_width() - W - pad, bell_y), ImGuiCond_Always);
+	ImGui::SetNextWindowSize(ImVec2(W, H), ImGuiCond_Always);
+	ImGui::SetNextWindowBgAlpha(0.0f);
+	ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+	ImGui::Begin("##bbl_error_bell", nullptr,
+		ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove
+		| ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoFocusOnAppearing
+		| ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBackground);
+
+	const ImVec2 p0 = ImGui::GetCursorScreenPos();
+	ImGui::InvisibleButton("##bell_hit", ImVec2(W, H));
+	const bool clicked = ImGui::IsItemClicked();
+	const bool hovered = ImGui::IsItemHovered();
+
+	// Draw a red bell with the white count (only rendered when count > 0).
+	const ImU32 col = IM_COL32(214, 40, 40, 255);
+	ImDrawList *dl = ImGui::GetWindowDrawList();
+	const float cx = p0.x + W * 0.5f;
+	dl->AddCircleFilled(ImVec2(cx, p0.y + H * 0.10f), W * 0.09f, col, 16);            // top handle
+	const float domeR  = W * 0.34f;
+	const float domeCy = p0.y + H * 0.34f;
+	dl->AddCircleFilled(ImVec2(cx, domeCy), domeR, col, 24);                          // rounded shoulders
+	const float baseY    = p0.y + H * 0.66f;
+	const float baseHalf = W * 0.46f;
+	dl->AddQuadFilled(ImVec2(cx - domeR, domeCy), ImVec2(cx + domeR, domeCy),
+					  ImVec2(cx + baseHalf, baseY), ImVec2(cx - baseHalf, baseY), col); // flared body
+	dl->AddRectFilled(ImVec2(cx - baseHalf - W * 0.05f, baseY),
+					  ImVec2(cx + baseHalf + W * 0.05f, baseY + H * 0.09f), col, H * 0.04f); // base lip
+	dl->AddCircleFilled(ImVec2(cx, baseY + H * 0.16f), W * 0.10f, col, 12);           // clapper
+	if (count > 0) {
+		char num[8];
+		snprintf(num, sizeof(num), "%d", count);
+		const ImVec2 ts = ImGui::CalcTextSize(num);
+		dl->AddText(ImVec2(cx - ts.x * 0.5f, domeCy - ts.y * 0.5f), IM_COL32(255, 255, 255, 255), num);
+	}
+
+	if (clicked) {
+		for (const auto &n : m_pop_notifications)
+			if (n->get_state() == PopNotification::EState::Hidden && is_alert(n->get_data().level))
+				n->hide(false);          // un-hide -> re-inits to Shown with a fresh timer
+		canvas.request_extra_frame();    // honored at the end of THIS render pass -> repaints now
+	}
+	ImGui::End();
+	ImGui::PopStyleVar();
+
+	// Themed tooltip (rendered outside the zero-padding bell window so it isn't cramped).
+	if (hovered) {
+		const std::string tip = std::to_string(count) + (count == 1 ? " hidden alert - click to show"
+																	  : " hidden alerts - click to show");
+		wxGetApp().imgui()->tooltip(tip.c_str(), ImGui::GetFontSize() * 15.0f);
+	}
 }
 
 void NotificationManager::maybe_reshow_object_info(GLCanvas3D &canvas)
 {
-	if (!m_has_object_info)
-		return;
 	auto *app_config = wxGetApp().app_config;
-	if (!app_config || app_config->get("auto_hide_object_info") != "true")
+	const bool enabled = m_has_object_info && app_config && app_config->get("auto_hide_object_info") == "true";
+
+	// Is the mouse in the bottom-right corner where the box lives?
+	const Size   cnv = canvas.get_canvas_size();
+	const ImVec2 m   = ImGui::GetMousePos();
+	const float  w   = (float) cnv.get_width();
+	const float  h   = (float) cnv.get_height();
+	const float  hot_w = 360.0f * m_scale;
+	const float  hot_h = 220.0f * m_scale;
+	const bool inside = enabled && m.x >= w - hot_w && m.x <= w && m.y >= h - hot_h && m.y <= h;
+	// Edge-trigger: only re-show on a fresh entry into the corner, so closing with X
+	// (while the mouse is already there) doesn't instantly re-open it.
+	const bool rising = inside && !m_info_corner_was_inside;
+	m_info_corner_was_inside = inside;
+	if (!rising)
 		return;
 
 	// If the object-info box is still on screen, nothing to do (its own hover-keep applies).
@@ -2703,17 +2836,9 @@ void NotificationManager::maybe_reshow_object_info(GLCanvas3D &canvas)
 			return;
 	}
 
-	// Re-show when the mouse is in the bottom-right corner where the box lives.
-	const Size   cnv = canvas.get_canvas_size();
-	const ImVec2 m   = ImGui::GetMousePos();
-	const float  w   = (float) cnv.get_width();
-	const float  h   = (float) cnv.get_height();
-	const float  hot_w = 360.0f * m_scale;
-	const float  hot_h = 220.0f * m_scale;
-	if (m.x >= w - hot_w && m.x <= w && m.y >= h - hot_h && m.y <= h) {
-		bbl_show_objectsinfo_notification(m_object_info_text, m_object_info_is_warning, false,
-										  m_object_info_hypertext, m_object_info_callback);
-	}
+	bbl_show_objectsinfo_notification(m_object_info_text, m_object_info_is_warning, false,
+									  m_object_info_hypertext, m_object_info_callback);
+	canvas.request_extra_frame(); // honored at the end of THIS render pass -> paints now
 }
 
 bool NotificationManager::update_notifications(GLCanvas3D& canvas)
