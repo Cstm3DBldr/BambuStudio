@@ -1157,6 +1157,10 @@ void BooleanOperationEngine::apply_result_to_model(const BooleanOperationResult&
                                                   const std::vector<ModelObject*>& b_group_objects) {
     if (!result.success || result.result_meshes.empty() || settings.target_mode == BooleanTargetMode::Unknown)
         return;
+
+    // BBS: boolean rebuilds the mesh; warn that painting is transferred approximately.
+    if (!wxGetApp().confirm_mesh_paint_warning())
+        return;
     (void)object_index;
 
     auto add_object_to_sidebar = [](ModelObject* obj) {
@@ -1380,6 +1384,8 @@ ModelVolume* BooleanOperationEngine::create_result_volume(ModelObject* target_ob
 
     // Copy the transformation from source volume
     new_volume->set_transformation(source_volume->get_transformation());
+    // BBS: best-effort transfer of painting from the source onto the boolean result.
+    new_volume->reproject_paint_from(*source_volume);
     return new_volume;
 }
 

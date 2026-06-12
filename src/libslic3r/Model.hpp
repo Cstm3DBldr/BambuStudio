@@ -989,6 +989,18 @@ public:
     t_model_material_id material_id() const { return m_material_id; }
     void                set_material_id(t_model_material_id material_id);
     void                reset_extra_facets();
+    // BBS: best-effort paint preservation across mesh-rebuilding operations
+    // (repair/simplify/smooth). Replaces the mesh, then re-projects all four
+    // paint layers from the OLD mesh onto the new one by nearest-surface lookup.
+    // Approximate: a remeshed surface has no exact face correspondence.
+    void                set_mesh_keep_paint(TriangleMesh &&mesh);
+    // BBS: best-effort copy of all paint layers from src onto this volume's
+    // current mesh by nearest-surface lookup (used for boolean results).
+    void                reproject_paint_from(const ModelVolume &src);
+    // BBS: multi-source variant for boolean union/merge of several volumes. Each
+    // source mesh is transformed by its paired matrix into this volume's frame,
+    // then nearest-surface lookup carries all four paint layers.
+    void                reproject_paint_from_volumes(const std::vector<std::pair<const ModelVolume*, Transform3d>> &srcs);
     ModelMaterial*      material() const;
     void                set_material(t_model_material_id material_id, const ModelMaterial &material);
     // Extract the current extruder ID based on this ModelVolume's config and the parent ModelObject's config.

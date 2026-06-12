@@ -3215,6 +3215,11 @@ void ObjectList::merge(bool to_multipart_object)
                     }
                 }
                 new_volume->mmu_segmentation_facets.assign(std::move(volume->mmu_segmentation_facets));
+                // BBS: also carry support/seam/fuzzy-skin painting across the merge
+                // (each part keeps its own mesh, so the per-triangle data maps 1:1).
+                new_volume->supported_facets.assign(std::move(volume->supported_facets));
+                new_volume->seam_facets.assign(std::move(volume->seam_facets));
+                new_volume->fuzzy_skin_facets.assign(std::move(volume->fuzzy_skin_facets));
             }
             new_object->sort_volumes(true);
 
@@ -3415,6 +3420,10 @@ void ObjectList::boolean()
     if (obj_idxs.empty() && vol_idxs.empty())
         return;
 
+    // BBS: boolean rebuilds the mesh; warn that painting is transferred approximately.
+    if (!wxGetApp().confirm_mesh_paint_warning())
+        return;
+
     Plater::TakeSnapshot snapshot(wxGetApp().plater(), "boolean");
 
     ModelObject* object = (*m_objects)[obj_idxs.front()];
@@ -3428,6 +3437,18 @@ void ObjectList::boolean()
     if (new_object->instances.empty())
         new_object->add_instance();
     ModelVolume* new_volume = new_object->add_volume(mesh);
+
+    // BBS: best-effort transfer painting from all source parts onto the union
+    // result. combine_mesh_fff bakes each volume's matrix into object space, so
+    // the sources are projected with their own matrices to match. Must run
+    // before center_around_origin() shifts the mesh.
+    {
+        std::vector<std::pair<const ModelVolume*, Transform3d>> bsrcs;
+        for (const ModelVolume* v : object->volumes)
+            if (v->is_model_part())
+                bsrcs.emplace_back(v, v->get_matrix());
+        new_volume->reproject_paint_from_volumes(bsrcs);
+    }
 
     // BBS: ensure on bed but no need to ensure locate in the center around origin
     new_object->ensure_on_bed();
@@ -6211,6 +6232,10 @@ void ObjectList::fix_through_netfabb()
     if (!wxGetApp().plater()->get_view3D_canvas3D()->get_gizmos_manager().check_gizmos_closed_except(GLGizmosManager::Undefined))
         return;
 
+    // BBS: repair rebuilds the mesh; warn that painting is transferred approximately.
+    if (!wxGetApp().confirm_mesh_paint_warning())
+        return;
+
     //          model_name
     std::vector<std::string>                           succes_models;
     //                   model_name     failing reason
@@ -6268,7 +6293,9 @@ void ObjectList::fix_through_netfabb()
             msg += "\n";
         }
 
-        plater->clear_before_change_mesh(obj_idx);
+        // BBS: do NOT wipe painting here; the repair below re-projects it
+        // (best-effort) via set_mesh_keep_paint instead.
+        // plater->clear_before_change_mesh(obj_idx);
         std::string res;
         if (!fix_model_by_win10_sdk_gui(*(object(obj_idx)), vol_idx, progress_dlg, msg, res))
             return false;
@@ -6340,6 +6367,9 @@ void ObjectList::fix_through_netfabb()
 
 void ObjectList::simplify()
 {
+    // BBS: this rebuilds the mesh; warn that painting is transferred approximately.
+    if (!wxGetApp().confirm_mesh_paint_warning())
+        return;
     auto plater = wxGetApp().plater();
     if (!plater) {
         return;
@@ -6398,8 +6428,7 @@ void GUI::ObjectList::smooth_mesh()
             bool ok;
             auto result_mesh = TriangleMeshDeal::smooth_triangle_mesh(mv->mesh(), ok);
             if (ok) {
-                mv->set_mesh(result_mesh);
-                mv->reset_extra_facets(); // reset paint color
+                mv->set_mesh_keep_paint(std::move(result_mesh)); // BBS: best-effort paint transfer
                 mv->calculate_convex_hull();
                 mv->invalidate_convex_hull_2d();
                 mv->set_new_unique_id();
@@ -6424,8 +6453,7 @@ void GUI::ObjectList::smooth_mesh()
             bool ok;
             auto result_mesh = TriangleMeshDeal::smooth_triangle_mesh(mv->mesh(),ok);
             if (ok) {
-                mv->set_mesh(result_mesh);
-                mv->reset_extra_facets(); // reset paint color
+                mv->set_mesh_keep_paint(std::move(result_mesh)); // BBS: best-effort paint transfer
                 mv->calculate_convex_hull();
                 mv->invalidate_convex_hull_2d();
                 mv->set_new_unique_id();
