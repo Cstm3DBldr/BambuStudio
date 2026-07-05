@@ -1,6 +1,10 @@
 #include "TriangleSelector.hpp"
 #include "Model.hpp"
 
+#include <algorithm>
+#include <cmath>
+#include <functional>
+#include <map>
 #include <boost/container/small_vector.hpp>
 #include <boost/log/trivial.hpp>
 
@@ -993,6 +997,111 @@ void TriangleSelector::set_facet(int facet_idx, EnforcerBlockerType state)
     m_triangles[facet_idx].set_state(state);
 }
 
+EnforcerBlockerType TriangleSelector::state_at(const Vec3f &hit, int facet_idx) const
+{
+    if (facet_idx < 0 || facet_idx >= m_orig_size_indices)
+        return EnforcerBlockerType::NONE;
+    const int leaf = this->select_unsplit_triangle(hit, facet_idx);
+    if (leaf < 0 || leaf >= int(m_triangles.size()) || !m_triangles[leaf].valid() || m_triangles[leaf].is_split())
+        return EnforcerBlockerType::NONE;
+    return m_triangles[leaf].get_state();
+}
+
+void TriangleSelector::paint_by_sampler(const std::function<EnforcerBlockerType(const Vec3f &)> &sampler, float edge_limit)
+{
+    this->reset();
+    this->set_edge_limit(edge_limit);
+    // Mirror select_triangle(): seed each original face from the member neighbor list
+    // (m_neighbors is per-original-face and stays valid across reset()), then collapse
+    // any children that ended up the same state. Using the wrong neighbor list corrupts
+    // the split tree inside split_triangle() and crashes.
+    for (int i = 0; i < m_orig_size_indices; ++i) {
+        if (!m_triangles[i].valid())
+            continue;
+        this->paint_triangle_by_sampler(i, m_neighbors[i], sampler, 0);
+        this->remove_useless_children(i);
+    }
+    this->garbage_collect();
+}
+
+void TriangleSelector::paint_triangle_by_sampler(int facet_idx, const Vec3i &neighbors,
+                                                 const std::function<EnforcerBlockerType(const Vec3f &)> &sampler,
+                                                 int depth)
+{
+    // Hard cap on subdivision depth. log2(largest_edge / edge_limit) is well under this
+    // for any real mesh; the cap only guards against a pathological (e.g. sliver) triangle
+    // that never reaches the edge limit, which would otherwise overflow the stack.
+    static const int MAX_DEPTH = 14;
+    if (facet_idx < 0 || facet_idx >= int(m_triangles.size()))
+        return;
+    Triangle *tr = &m_triangles[facet_idx];
+    if (!tr->valid())
+        return;
+
+    const Vec3f a = m_vertices[tr->verts_idxs[0]].v;
+    const Vec3f b = m_vertices[tr->verts_idxs[1]].v;
+    const Vec3f c = m_vertices[tr->verts_idxs[2]].v;
+    const float max_edge2  = std::max({(a - b).squaredNorm(), (b - c).squaredNorm(), (c - a).squaredNorm()});
+    const float edge_limit = std::sqrt(m_edge_limit_sqr);
+    const bool  can_split  = max_edge2 > m_edge_limit_sqr && depth < MAX_DEPTH;
+
+    // Detection grid resolution: spacing ~= edge_limit so painted features down to the
+    // target fidelity trigger a split. Denser on bigger triangles, capped so a huge flat
+    // face doesn't sample thousands of points.
+    const int res = std::clamp(int(std::ceil(std::sqrt(max_edge2) / std::max(edge_limit, 1e-3f))), 2, 24);
+
+    auto point_at = [&](int u, int v) {
+        const float bu = float(u) / float(res), bv = float(v) / float(res);
+        return bu * a + bv * b + (1.f - bu - bv) * c;
+    };
+
+    // Uniformity scan with early-out: on a splittable triangle, the first mismatch is enough
+    // to know we must subdivide, so bail immediately instead of sampling the whole grid.
+    bool have_first = false, uniform = true;
+    EnforcerBlockerType first = EnforcerBlockerType::NONE;
+    for (int u = 0; u <= res && uniform; ++u)
+        for (int v = 0; u + v <= res; ++v) {
+            const EnforcerBlockerType s = sampler(point_at(u, v));
+            if (!have_first) { first = s; have_first = true; }
+            else if (s != first) { uniform = false; break; }
+        }
+
+    if (!uniform && can_split) {
+        if (!tr->is_split())
+            this->split_triangle(facet_idx, neighbors);
+        tr = &m_triangles[facet_idx]; // split_triangle may have reallocated m_triangles
+        // split_triangle() can DECLINE (degenerate/sliver, or edges already at the limit);
+        // the triangle then stays a leaf with uninitialized children[] - recursing would read
+        // garbage and crash. Only recurse when it actually split (the guard
+        // select_triangle_recursive() spells as `if (num_of_children != 1)`).
+        if (tr->is_split()) {
+            const int num_children = tr->number_of_split_sides() + 1;
+            for (int i = 0; i < num_children; ++i) {
+                this->paint_triangle_by_sampler(tr->children[i], this->child_neighbors(*tr, neighbors, i), sampler, depth + 1);
+                tr = &m_triangles[facet_idx];
+            }
+            return;
+        }
+        // fell through: could not split - assign as a leaf below.
+    }
+
+    // Leaf. Uniform -> the single sampled state. Non-uniform but unsplittable (at edge limit
+    // or depth cap) -> the dominant of a full grid sample.
+    EnforcerBlockerType state = first;
+    if (!uniform) {
+        std::map<int, int> tally;
+        for (int u = 0; u <= res; ++u)
+            for (int v = 0; u + v <= res; ++v)
+                ++tally[int(sampler(point_at(u, v)))];
+        int best_state = int(EnforcerBlockerType::NONE), best_count = 0;
+        for (const auto &kv : tally)
+            if (kv.second > best_count) { best_count = kv.second; best_state = kv.first; }
+        state = EnforcerBlockerType(best_state);
+    }
+    this->undivide_triangle(facet_idx);
+    m_triangles[facet_idx].set_state(state);
+}
+
 // called by select_patch()->select_triangle()...select_triangle()
 // to decide which sides of the triangle to split and to actually split it calling set_division() and perform_split().
 void TriangleSelector::split_triangle(int facet_idx, const Vec3i &neighbors)
@@ -1016,9 +1125,10 @@ void TriangleSelector::split_triangle(int facet_idx, const Vec3i &neighbors)
                                              &m_vertices[facet[2]].v};
     std::array<stl_vertex, 3> pts_transformed; // must stay in scope of pts !!!
 
-    // In case the object is non-uniformly scaled, transform the
-    // points to world coords.
-    if (! m_cursor->uniform_scaling) {
+    // In case the object is non-uniformly scaled, transform the points to world coords.
+    // paint_by_sampler() drives splits without a brush cursor (m_cursor is null) and works
+    // directly in the mesh's local frame, so skip the world transform when there is no cursor.
+    if (m_cursor && ! m_cursor->uniform_scaling) {
         for (size_t i=0; i<pts.size(); ++i) {
             pts_transformed[i] = m_cursor->trafo * (*pts[i]);
             pts[i] = &pts_transformed[i];

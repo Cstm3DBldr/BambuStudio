@@ -12,7 +12,6 @@
 #include "TriangleSelector.hpp"
 #include "AABBTreeIndirect.hpp"
 #include <queue>
-#include <fstream> // BOOLDBG temporary
 
 #include "Format/AMF.hpp"
 #include "Format/svg.hpp"
@@ -3265,13 +3264,6 @@ static void reproj_transfer(const TriangleMesh &old_mesh, const TriangleMesh &ne
     reproj_apply_states(new_mesh, n_seam,  d_seam);
     reproj_apply_states(new_mesh, n_mmu,   d_mmu);
     reproj_apply_states(new_mesh, n_fuzzy, d_fuzzy);
-    { int inmmu=0; for (auto s : o_mmu) if (s != EnforcerBlockerType::NONE) ++inmmu;
-      int outmmu=0; for (auto s : n_mmu) if (s != EnforcerBlockerType::NONE) ++outmmu;
-      std::ofstream _d("C:\\Users\\Mike\\booldbg.txt", std::ios::app);
-      _d << "BOOLDBG reproj_transfer old_faces=" << old_mesh.its.indices.size()
-         << " new_faces=" << nf << " cutoff=" << cutoff
-         << " mmu_in=" << (int)o_mmu.size() << " mmu_painted_in=" << inmmu
-         << " mmu_painted_out=" << outmmu << "\n"; }
 }
 
 void ModelVolume::set_mesh_keep_paint(TriangleMesh &&mesh_in)
@@ -3303,52 +3295,108 @@ void ModelVolume::reproject_paint_from(const ModelVolume &src)
 
 void ModelVolume::reproject_paint_from_volumes(const std::vector<std::pair<const ModelVolume*, Transform3d>> &srcs)
 {
-    // Build one combined source mesh in THIS volume's frame, with per-face
-    // dominant states accumulated in the same face order (transforms preserve
-    // face count/order, and its_merge appends faces without reindexing).
-    { std::ofstream _d("C:\\Users\\Mike\\booldbg.txt", std::ios::app);
-      _d << "BOOLDBG === reproject_paint_from_volumes ENTER srcs=" << srcs.size()
-         << " this_faces=" << this->mesh().its.indices.size() << "\n"; }
-    TriangleMesh combined;
-    std::vector<EnforcerBlockerType> o_sup, o_seam, o_mmu, o_fuzzy;
+    // High-fidelity paint transfer. The old path flattened every source face and every
+    // result face to ONE dominant color, so hand-painted brush detail smaller than a base
+    // face was lost when the boolean rebuilt the mesh into coarse triangles. Here we keep
+    // each source's FULL subdivided paint, sample it per-point, and drive the union's own
+    // TriangleSelector to subdivide only where the color changes - preserving brush detail
+    // without bloating uniform regions.
+    struct SrcVol {
+        Transform3d to_src;          // union-local point -> this source volume's local point
+        int         face_begin = 0;  // first merged-mesh face owned by this volume
+        int         face_end   = 0;  // one past the last
+        int         base_extruder = 0;
+        std::shared_ptr<TriangleSelector> sel_mmu, sel_sup, sel_seam, sel_fuzzy;
+    };
+    std::vector<SrcVol> vols;
+    TriangleMesh        combined; // every source BASE mesh, merged, in THIS (union) volume's frame
+
     for (const auto &pr : srcs) {
         const ModelVolume *sv = pr.first;
         if (sv == nullptr || sv->mesh().its.indices.empty())
             continue;
-        std::vector<EnforcerBlockerType> s_sup, s_seam, s_mmu, s_fuzzy;
-        reproj_per_face_states(sv->mesh(), sv->supported_facets,        s_sup);
-        reproj_per_face_states(sv->mesh(), sv->seam_facets,             s_seam);
-        reproj_per_face_states(sv->mesh(), sv->mmu_segmentation_facets, s_mmu);
-        reproj_per_face_states(sv->mesh(), sv->fuzzy_skin_facets,       s_fuzzy);
-        // Boolean fuses every source part into ONE volume that can carry only a single
-        // base filament. A part colored via the filament dropdown (whole-part extruder,
-        // NOT brush paint) has an empty mmu layer, so without this it collapses to one
-        // color. Bake each source's base filament into its UNPAINTED faces as explicit
-        // mmu paint, so every region keeps its color on the fused result. Brush-painted
-        // faces already hold their own extruder and are left untouched.
-        {
-            const int base = sv->extruder_id();
-            int brushed=0; for (auto s : s_mmu) if (s != EnforcerBlockerType::NONE) ++brushed;
-            { std::ofstream _d("C:\\Users\\Mike\\booldbg.txt", std::ios::app);
-              _d << "BOOLDBG src faces=" << s_mmu.size() << " base_extruder=" << base
-                 << " brushed_faces=" << brushed << "\n"; }
-            if (base >= 1 && base <= (int)EnforcerBlockerType::ExtruderMax) {
-                const EnforcerBlockerType base_state = static_cast<EnforcerBlockerType>(base);
-                for (EnforcerBlockerType &st : s_mmu)
-                    if (st == EnforcerBlockerType::NONE) st = base_state;
-            }
-        }
+        SrcVol sd;
+        sd.to_src        = pr.second.inverse();
+        sd.base_extruder = sv->extruder_id();
+        auto make_sel = [sv](const FacetsAnnotation &ann) {
+            auto s = std::make_shared<TriangleSelector>(sv->mesh());
+            if (!ann.empty())
+                s->deserialize(ann.get_data(), true);
+            return s;
+        };
+        sd.sel_mmu   = make_sel(sv->mmu_segmentation_facets);
+        sd.sel_sup   = make_sel(sv->supported_facets);
+        sd.sel_seam  = make_sel(sv->seam_facets);
+        sd.sel_fuzzy = make_sel(sv->fuzzy_skin_facets);
+
         TriangleMesh m = sv->mesh();
         m.transform(pr.second, true);
+        sd.face_begin = int(combined.its.indices.size());
         combined.merge(m);
-        o_sup.insert(o_sup.end(),     s_sup.begin(),   s_sup.end());
-        o_seam.insert(o_seam.end(),   s_seam.begin(),  s_seam.end());
-        o_mmu.insert(o_mmu.end(),     s_mmu.begin(),   s_mmu.end());
-        o_fuzzy.insert(o_fuzzy.end(), s_fuzzy.begin(), s_fuzzy.end());
+        sd.face_end = int(combined.its.indices.size());
+        vols.push_back(std::move(sd));
     }
-    reproj_transfer(combined, this->mesh(), o_sup, o_seam, o_mmu, o_fuzzy,
-                    this->supported_facets, this->seam_facets,
-                    this->mmu_segmentation_facets, this->fuzzy_skin_facets);
+
+    if (combined.its.indices.empty() || this->mesh().its.indices.empty()) {
+        this->supported_facets.reset();       this->seam_facets.reset();
+        this->mmu_segmentation_facets.reset(); this->fuzzy_skin_facets.reset();
+        return;
+    }
+
+    auto tree = AABBTreeIndirect::build_aabb_tree_over_indexed_triangle_set(
+        combined.its.vertices, combined.its.indices);
+
+    // Reject matches farther than 2% of the combined bbox diagonal (same as the old path)
+    // so brand-new boolean surfaces stay unpainted instead of snapping to a distant color.
+    Vec3f bbmin = combined.its.vertices.front(), bbmax = bbmin;
+    for (const Vec3f &p : combined.its.vertices) { bbmin = bbmin.cwiseMin(p); bbmax = bbmax.cwiseMax(p); }
+    const double diag    = (bbmax - bbmin).cast<double>().norm();
+    const double cutoff2 = (0.02 * diag) * (0.02 * diag);
+
+    auto owner_of = [&vols](int face) -> const SrcVol* {
+        for (const SrcVol &sd : vols)
+            if (face >= sd.face_begin && face < sd.face_end) return &sd;
+        return nullptr;
+    };
+
+    enum class Layer { Mmu, Sup, Seam, Fuzzy };
+    auto sample = [&](const Vec3f &p_union, Layer layer) -> EnforcerBlockerType {
+        size_t face = size_t(-1); Vec3f hitp;
+        double d2 = AABBTreeIndirect::squared_distance_to_indexed_triangle_set(
+            combined.its.vertices, combined.its.indices, tree, p_union, face, hitp);
+        if (d2 < 0. || d2 > cutoff2 || face == size_t(-1))
+            return EnforcerBlockerType::NONE;
+        const SrcVol *sd = owner_of(int(face));
+        if (sd == nullptr) return EnforcerBlockerType::NONE;
+        const int   local_face = int(face) - sd->face_begin;
+        const Vec3f p_src      = (sd->to_src * hitp.cast<double>()).cast<float>();
+        const TriangleSelector *sel = layer == Layer::Mmu  ? sd->sel_mmu.get()
+                                    : layer == Layer::Sup  ? sd->sel_sup.get()
+                                    : layer == Layer::Seam ? sd->sel_seam.get()
+                                                           : sd->sel_fuzzy.get();
+        EnforcerBlockerType st = sel->state_at(p_src, local_face);
+        // MMU only: a part colored via the filament dropdown (no brush) has an empty mmu
+        // layer - fall back to its base filament so every region keeps its color on the
+        // fused result. The other layers have no "base" and stay NONE where unpainted.
+        if (layer == Layer::Mmu && st == EnforcerBlockerType::NONE
+            && sd->base_extruder >= 1 && sd->base_extruder <= int(EnforcerBlockerType::ExtruderMax))
+            st = EnforcerBlockerType(sd->base_extruder);
+        return st;
+    };
+
+    // 0.2 mm matches the finest edge the brush itself paints, so even thin brush strokes
+    // survive; uniform regions stay a single triangle so the mesh does not bloat.
+    const float edge_limit = 0.2f;
+    auto apply = [&](Layer layer, FacetsAnnotation &dst) {
+        TriangleSelector sel(this->mesh());
+        sel.paint_by_sampler([&, layer](const Vec3f &p) { return sample(p, layer); }, edge_limit);
+        dst.reset();
+        dst.set(sel);
+    };
+    apply(Layer::Sup,   this->supported_facets);
+    apply(Layer::Seam,  this->seam_facets);
+    apply(Layer::Mmu,   this->mmu_segmentation_facets);
+    apply(Layer::Fuzzy, this->fuzzy_skin_facets);
 }
 // ------------------------------------------------------------------------------
 

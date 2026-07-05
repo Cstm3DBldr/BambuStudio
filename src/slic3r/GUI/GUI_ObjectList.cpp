@@ -3453,10 +3453,16 @@ void ObjectList::boolean()
         const Transform3d inst = object->instances.empty()
             ? Transform3d::Identity()
             : object->instances.front()->get_matrix();
+        // add_volume() recentered the union mesh to its own origin and moved that
+        // offset into new_volume's transform, so new_volume->mesh() is in the volume's
+        // LOCAL frame - not world. Bring the world-space sources (inst * volume matrix)
+        // into that same local frame with new_volume->get_matrix().inverse(); otherwise
+        // every source sits ~100 mm from the recentered result and all paint is dropped.
+        const Transform3d world_to_local = new_volume->get_matrix().inverse();
         std::vector<std::pair<const ModelVolume*, Transform3d>> bsrcs;
         for (const ModelVolume* v : object->volumes)
             if (v->is_model_part())
-                bsrcs.emplace_back(v, inst * v->get_matrix());
+                bsrcs.emplace_back(v, world_to_local * inst * v->get_matrix());
         // Best-effort: a degenerate boolean result must never take down the app.
         // Losing the paint transfer is acceptable; crashing is not.
         try {
