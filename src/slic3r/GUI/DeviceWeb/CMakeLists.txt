@@ -1,19 +1,19 @@
-﻿# GUI/DeviceWeb
+# GUI/DeviceWeb
 # usage -- GUI about device web for BambuStudio
 # date -- 2025.01.01
 # status -- Building
 
-# ==================== Node.js/pnpm 环境准备（仅用于 deviceweb 构建）====================
+# ==================== Node.js/pnpm ????(??? deviceweb ??)====================
 
 function(prepare_node_env)
-    # 定义版本号
+    # ?????
     set(NODE_VERSION "22.22.2")
     set(PNPM_VERSION "10.12.1")
 
-    # 定义本地缓存目录（放在项目同级目录，clean build 后不会丢失）
+    # ????????(????????,clean build ?????)
     set(NODE_CACHE_DIR "${CMAKE_SOURCE_DIR}/../node-cache")
 
-    # 根据平台确定下载 URL、文件名和 hash 值
+    # ???????? URL????? hash ?
     if(WIN32)
         set(NODE_URL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-win-x64.zip")
         set(NODE_ARCHIVE_NAME "node-v${NODE_VERSION}-win-x64.zip")
@@ -55,12 +55,12 @@ function(prepare_node_env)
         set(PNPM_HASH "eb2dc1f109bca046ce734d062c8dd8f34db2b58a115992f9b086456efd7b2305")
     endif()
 
-    # 定义最终的可执行文件路径
+    # ????????????
     set(NODE_EXECUTABLE "${NODE_CACHE_DIR}/${NODE_BIN_DIR}/${NODE_EXEC}")
-    # pnpm 放到 node 同目录，这样执行 pnpm 时 PATH 中天然能找到 node
+    # pnpm ?? node ???,???? pnpm ? PATH ?????? node
     set(PNPM_EXECUTABLE "${NODE_CACHE_DIR}/${NODE_BIN_DIR}/${PNPM_EXEC_NAME}")
 
-    # ============ Node.js 下载 + 解压 ============
+    # ============ Node.js ?? + ?? ============
     if(NOT EXISTS "${NODE_EXECUTABLE}")
         message(STATUS "Downloading Node.js v${NODE_VERSION} from ${NODE_URL}")
         file(MAKE_DIRECTORY "${NODE_CACHE_DIR}")
@@ -104,7 +104,7 @@ function(prepare_node_env)
             message(FATAL_ERROR "Failed to extract Node.js archive: ${extract_error}")
         endif()
 
-        # 清理压缩包（节省空间）
+        # ?????(????)
         file(REMOVE "${NODE_CACHE_DIR}/${NODE_ARCHIVE_NAME}")
 
         if(NOT EXISTS "${NODE_EXECUTABLE}")
@@ -116,7 +116,7 @@ function(prepare_node_env)
         message(STATUS "Found cached Node.js: ${NODE_EXECUTABLE}")
     endif()
 
-    # ============ pnpm 独立二进制下载 ============
+    # ============ pnpm ??????? ============
     if(NOT EXISTS "${PNPM_EXECUTABLE}")
         message(STATUS "Downloading pnpm v${PNPM_VERSION} from ${PNPM_URL}")
 
@@ -151,15 +151,15 @@ function(prepare_node_env)
         message(STATUS "Found cached pnpm: ${PNPM_EXECUTABLE}")
     endif()
 
-    # 设置输出变量（使用绝对路径）
+    # ??????(??????)
     set(NODE_EXECUTABLE "${NODE_EXECUTABLE}" PARENT_SCOPE)
     set(PNPM_EXECUTABLE "${PNPM_EXECUTABLE}" PARENT_SCOPE)
 endfunction()
 
-# 执行环境准备（在 config 阶段执行）
+# ??????(? config ????)
 prepare_node_env()
 
-# ==================== 前端工程构建 ====================
+# ==================== ?????? ====================
 
 set(DEVICE_PAGE_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/device_page")
 set(DEVICE_PAGE_DIST_DIR "${DEVICE_PAGE_SRC_DIR}/dist")
@@ -168,11 +168,11 @@ set(DEVICE_PAGE_TARGET_DIR "${CMAKE_SOURCE_DIR}/resources/web/device_page/dist")
 get_filename_component(NODE_BIN_PATH "${NODE_EXECUTABLE}" DIRECTORY)
 
 if(WIN32)
-    # 原本PATH末尾的\会影响后续的分隔符，需要处理
+    # ??PATH???\?????????,????
     set(DEVICE_PAGE_PATH_UNESCAPED "${NODE_BIN_PATH};$ENV{PATH}")
     string(REPLACE "\;" ";" DEVICE_PAGE_PATH "${DEVICE_PAGE_PATH_UNESCAPED}")
 else()
-    # Unix PATH 分隔符是 :
+    # Unix PATH ???? :
     set(DEVICE_PAGE_PATH "${NODE_BIN_PATH}:$ENV{PATH}")
 endif()
 
@@ -180,8 +180,6 @@ set(PNPM_STORE_DIR "${CMAKE_CURRENT_BINARY_DIR}/.pnpm-store")
 file(MAKE_DIRECTORY "${PNPM_STORE_DIR}")
 
 add_custom_target(device_page_build ALL
-    COMMAND ${CMAKE_COMMAND} -E env "PATH=${DEVICE_PAGE_PATH}" "PNPM_STORE_DIR=${PNPM_STORE_DIR}" ${PNPM_EXECUTABLE} install
-    COMMAND ${CMAKE_COMMAND} -E env "PATH=${DEVICE_PAGE_PATH}" "PNPM_STORE_DIR=${PNPM_STORE_DIR}" ${PNPM_EXECUTABLE} run build
     COMMAND  ${CMAKE_COMMAND} -E make_directory "${DEVICE_PAGE_TARGET_DIR}"
     COMMAND  ${CMAKE_COMMAND} -E copy_directory "${DEVICE_PAGE_DIST_DIR}" "${DEVICE_PAGE_TARGET_DIR}"
     WORKING_DIRECTORY ${DEVICE_PAGE_SRC_DIR}

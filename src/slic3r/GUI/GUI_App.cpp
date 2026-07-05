@@ -2488,6 +2488,18 @@ static LogEncOptions s_get_log_enc_opts()
     return enc_options;
 };
 
+bool GUI_App::confirm_mesh_paint_warning()
+{
+    MessageDialog dlg(nullptr,
+        _L("This operation rebuilds the model's mesh. Painted color, supports, seam and "
+           "fuzzy-skin will be transferred to the new mesh by a best-effort approximation, "
+           "so the result may be slightly off and, in rare cases, some painting may be lost.\n\n"
+           "Do you want to continue?"),
+        _L("Painting may change"),
+        wxICON_WARNING | wxYES_NO | wxNO_DEFAULT);
+    return dlg.ShowModal() == wxID_YES;
+}
+
 void GUI_App::init_app_config()
 {
 	// Profiles for the alpha are stored into the PrusaSlicer-alpha directory to not mix with the current release.
@@ -5655,10 +5667,18 @@ bool GUI_App::process_network_msg(std::string dev_id, std::string msg)
         }
         else if (msg == "unsigned_studio") {
             BOOST_LOG_TRIVIAL(info) << "process_network_msg, unsigned_studio";
-            MessageDialog msg_dlg(nullptr, _L("Your software is not signed, and some printing functions have been restricted. Please use the officially signed software version."), "", wxAPPLY | wxOK);
-            m_show_error_msgdlg = true;
-            auto modal_result = msg_dlg.ShowModal();
-            m_show_error_msgdlg = false;
+            // Local/unsigned test build: warn at most once per session and never stack
+            // dialogs. Without this guard (which the sibling handlers above all have),
+            // repeated "unsigned_studio" messages from the print/nozzle-mapping path open
+            // a modal each time, bricking the UI with a popup storm. Show once, ack, move on.
+            static bool s_unsigned_studio_warned = false;
+            if (!s_unsigned_studio_warned && !m_show_error_msgdlg) {
+                MessageDialog msg_dlg(nullptr, _L("Your software is not signed, and some printing functions have been restricted. Please use the officially signed software version."), "", wxAPPLY | wxOK);
+                m_show_error_msgdlg = true;
+                auto modal_result = msg_dlg.ShowModal();
+                m_show_error_msgdlg = false;
+                s_unsigned_studio_warned = true;
+            }
 
             return true;
         }

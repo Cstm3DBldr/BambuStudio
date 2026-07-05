@@ -10,6 +10,9 @@
 #include "MTUtils.hpp"
 #include "TriangleMeshSlicer.hpp"
 #include "TriangleSelector.hpp"
+#include "AABBTreeIndirect.hpp"
+#include <queue>
+#include <fstream> // BOOLDBG temporary
 
 #include "Format/AMF.hpp"
 #include "Format/svg.hpp"
@@ -2744,9 +2747,21 @@ ModelObjectPtrs ModelObject::merge_volumes(std::vector<int>& vol_indeces)
 
 #if 1
     TriangleMesh mesh;
+    // BBS: preserve painting across the merge. its_merge() appends faces in
+    // order (only vertex indices are offset), so face f of the merged mesh maps
+    // exactly to the captured per-part triangles below. Capture before
+    // reset_mesh() empties the source volumes.
+    std::vector<std::string> merged_supported, merged_seam, merged_mmu, merged_fuzzy;
     for (int i : vol_indeces) {
         auto volume = volumes[i];
         if (!volume->mesh().empty()) {
+            const size_t nf = volume->mesh().its.indices.size();
+            for (size_t f = 0; f < nf; ++f) {
+                merged_supported.emplace_back(volume->supported_facets.get_triangle_as_string((int)f));
+                merged_seam.emplace_back(volume->seam_facets.get_triangle_as_string((int)f));
+                merged_mmu.emplace_back(volume->mmu_segmentation_facets.get_triangle_as_string((int)f));
+                merged_fuzzy.emplace_back(volume->fuzzy_skin_facets.get_triangle_as_string((int)f));
+            }
             const auto volume_matrix = volume->get_matrix();
             TriangleMesh mesh_(volume->mesh());
             mesh_.transform(volume_matrix, true);
@@ -2766,6 +2781,13 @@ ModelObjectPtrs ModelObject::merge_volumes(std::vector<int>& vol_indeces)
 #endif
 
     ModelVolume* vol = upper->add_volume(mesh);
+    // BBS: re-apply the painting captured above onto the merged volume.
+    for (size_t f = 0; f < merged_mmu.size() && f < mesh.its.indices.size(); ++f) {
+        if (!merged_supported[f].empty()) vol->supported_facets.set_triangle_from_string((int)f, merged_supported[f]);
+        if (!merged_seam[f].empty())      vol->seam_facets.set_triangle_from_string((int)f, merged_seam[f]);
+        if (!merged_mmu[f].empty())       vol->mmu_segmentation_facets.set_triangle_from_string((int)f, merged_mmu[f]);
+        if (!merged_fuzzy[f].empty())     vol->fuzzy_skin_facets.set_triangle_from_string((int)f, merged_fuzzy[f]);
+    }
     for (int i = 0; i < volumes.size();i++) {
         if (std::find(vol_indeces.begin(), vol_indeces.end(), i) != vol_indeces.end()) {
             vol->name = "Merged Parts";
@@ -3105,6 +3127,230 @@ void ModelVolume::reset_extra_facets() {
     this->seam_facets.reset();
     this->mmu_segmentation_facets.reset();
 }
+
+// ---- BBS: best-effort paint re-projection across mesh-rebuilding ops ----------
+// Walk a TriangleSelector's split tree for source face s; return the first
+// non-NONE leaf state (collapses sub-triangle painting to the dominant intent).
+static EnforcerBlockerType reproj_first_leaf(TriangleSelector &sel, int root_idx)
+{
+    const auto &tris = sel.get_triangles();
+    if (root_idx < 0 || root_idx >= (int)tris.size()) return EnforcerBlockerType::NONE;
+    std::queue<int> q;
+    q.push(root_idx);
+    while (!q.empty()) {
+        int i = q.front(); q.pop();
+        const auto &t = tris[i];
+        if (!t.valid()) continue;
+        if (!t.is_split()) {
+            if (t.get_state() != EnforcerBlockerType::NONE)
+                return t.get_state();
+        } else {
+            for (int c : t.children) if (c >= 0) q.push(c);
+        }
+    }
+    return EnforcerBlockerType::NONE;
+}
+
+// Per-face dominant state of one annotation layer over `mesh`.
+static void reproj_per_face_states(const TriangleMesh &mesh, const FacetsAnnotation &ann,
+                                   std::vector<EnforcerBlockerType> &out)
+{
+    out.assign(mesh.its.indices.size(), EnforcerBlockerType::NONE);
+    if (ann.empty() || mesh.its.indices.empty()) return;
+    TriangleSelector sel(mesh);
+    sel.deserialize(ann.get_data(), true);
+    for (int f = 0; f < (int)mesh.its.indices.size(); ++f)
+        out[f] = reproj_first_leaf(sel, f);
+}
+
+// Write per-face states onto `mesh`'s annotation layer (NONE entries skipped).
+static void reproj_apply_states(const TriangleMesh &mesh,
+                                const std::vector<EnforcerBlockerType> &states,
+                                FacetsAnnotation &out)
+{
+    out.reset();
+    bool any = false;
+    TriangleSelector sel(mesh);
+    const int n = std::min<int>((int)states.size(), (int)mesh.its.indices.size());
+    for (int f = 0; f < n; ++f) {
+        if (states[f] != EnforcerBlockerType::NONE) { sel.set_facet(f, states[f]); any = true; }
+    }
+    if (any) out.set(sel);
+}
+
+// Pick the dominant (most frequent) non-NONE state from a small candidate list.
+// Returns NONE only when every candidate is NONE (or the list is empty), so a
+// single painted sample is enough to keep paint, while conflicting samples fall
+// to the majority instead of whichever happened to be nearest the centroid.
+static EnforcerBlockerType reproj_dominant(const std::vector<EnforcerBlockerType> &cand)
+{
+    EnforcerBlockerType best = EnforcerBlockerType::NONE;
+    int best_count = 0;
+    for (size_t i = 0; i < cand.size(); ++i) {
+        if (cand[i] == EnforcerBlockerType::NONE) continue;
+        int c = 0;
+        for (size_t j = 0; j < cand.size(); ++j)
+            if (cand[j] == cand[i]) ++c;
+        if (c > best_count) { best_count = c; best = cand[i]; }
+    }
+    return best;
+}
+
+// Map each face of new_mesh to the nearest face(s) of old_mesh, then transfer the
+// four precomputed old per-face state vectors onto new annotations.
+//
+// Robustness: a failed boolean can hand back a NON-empty but malformed mesh whose
+// face indices point past its own vertex list. Reading new_mesh.its.vertices[idx]
+// unchecked in that state is an out-of-bounds read -> hard crash. Every vertex
+// access below is bounds-guarded so a malformed result silently transfers no paint
+// instead of crashing the app.
+//
+// Fidelity: instead of a single centroid sample we sample the centroid plus the
+// three edge midpoints and take the dominant state, and we reject matches farther
+// than 2% of the old mesh's bounding-box diagonal so brand-new boolean surfaces
+// (far from any old face) stay unpainted rather than snapping to a distant color.
+static void reproj_transfer(const TriangleMesh &old_mesh, const TriangleMesh &new_mesh,
+                            const std::vector<EnforcerBlockerType> &o_sup,
+                            const std::vector<EnforcerBlockerType> &o_seam,
+                            const std::vector<EnforcerBlockerType> &o_mmu,
+                            const std::vector<EnforcerBlockerType> &o_fuzzy,
+                            FacetsAnnotation &d_sup, FacetsAnnotation &d_seam,
+                            FacetsAnnotation &d_mmu, FacetsAnnotation &d_fuzzy)
+{
+    d_sup.reset(); d_seam.reset(); d_mmu.reset(); d_fuzzy.reset();
+    if (old_mesh.its.indices.empty()  || new_mesh.its.indices.empty() ||
+        old_mesh.its.vertices.empty() || new_mesh.its.vertices.empty()) return;
+    auto tree = AABBTreeIndirect::build_aabb_tree_over_indexed_triangle_set(
+        old_mesh.its.vertices, old_mesh.its.indices);
+    const int nf  = (int)new_mesh.its.indices.size();
+    const int nnv = (int)new_mesh.its.vertices.size();
+
+    // Reject matches farther than 2% of the old mesh's bounding-box diagonal.
+    Vec3f bbmin = old_mesh.its.vertices.front(), bbmax = bbmin;
+    for (const Vec3f &v : old_mesh.its.vertices) { bbmin = bbmin.cwiseMin(v); bbmax = bbmax.cwiseMax(v); }
+    const double diag    = (bbmax - bbmin).cast<double>().norm();
+    const double cutoff  = 0.02 * diag;
+    const double cutoff2 = cutoff * cutoff;
+
+    std::vector<EnforcerBlockerType> n_sup(nf, EnforcerBlockerType::NONE), n_seam = n_sup, n_mmu = n_sup, n_fuzzy = n_sup;
+    std::vector<EnforcerBlockerType> c_sup, c_seam, c_mmu, c_fuzzy;
+    for (int f = 0; f < nf; ++f) {
+        const Vec3i &idx = new_mesh.its.indices[f];
+        // Guard against a malformed boolean result (indices past the vertex list).
+        if (idx[0] < 0 || idx[1] < 0 || idx[2] < 0 ||
+            idx[0] >= nnv || idx[1] >= nnv || idx[2] >= nnv) continue;
+        const Vec3f &v0 = new_mesh.its.vertices[idx[0]];
+        const Vec3f &v1 = new_mesh.its.vertices[idx[1]];
+        const Vec3f &v2 = new_mesh.its.vertices[idx[2]];
+        // Sample the centroid plus the three edge midpoints, then take the dominant.
+        const Vec3f samples[4] = { (v0 + v1 + v2) / 3.f, (v0 + v1) * 0.5f, (v1 + v2) * 0.5f, (v2 + v0) * 0.5f };
+        c_sup.clear(); c_seam.clear(); c_mmu.clear(); c_fuzzy.clear();
+        for (const Vec3f &s : samples) {
+            size_t hit = size_t(-1);
+            Vec3f hp;
+            double d2 = AABBTreeIndirect::squared_distance_to_indexed_triangle_set(
+                old_mesh.its.vertices, old_mesh.its.indices, tree, s, hit, hp);
+            if (d2 < 0. || d2 > cutoff2 || hit == size_t(-1) || hit >= o_sup.size()) continue;
+            c_sup.push_back(o_sup[hit]);
+            c_seam.push_back(o_seam[hit]);
+            c_mmu.push_back(o_mmu[hit]);
+            c_fuzzy.push_back(o_fuzzy[hit]);
+        }
+        n_sup[f]   = reproj_dominant(c_sup);
+        n_seam[f]  = reproj_dominant(c_seam);
+        n_mmu[f]   = reproj_dominant(c_mmu);
+        n_fuzzy[f] = reproj_dominant(c_fuzzy);
+    }
+    reproj_apply_states(new_mesh, n_sup,   d_sup);
+    reproj_apply_states(new_mesh, n_seam,  d_seam);
+    reproj_apply_states(new_mesh, n_mmu,   d_mmu);
+    reproj_apply_states(new_mesh, n_fuzzy, d_fuzzy);
+    { int inmmu=0; for (auto s : o_mmu) if (s != EnforcerBlockerType::NONE) ++inmmu;
+      int outmmu=0; for (auto s : n_mmu) if (s != EnforcerBlockerType::NONE) ++outmmu;
+      std::ofstream _d("C:\\Users\\Mike\\booldbg.txt", std::ios::app);
+      _d << "BOOLDBG reproj_transfer old_faces=" << old_mesh.its.indices.size()
+         << " new_faces=" << nf << " cutoff=" << cutoff
+         << " mmu_in=" << (int)o_mmu.size() << " mmu_painted_in=" << inmmu
+         << " mmu_painted_out=" << outmmu << "\n"; }
+}
+
+void ModelVolume::set_mesh_keep_paint(TriangleMesh &&mesh_in)
+{
+    const TriangleMesh old_mesh = this->mesh(); // copy before replacing
+    std::vector<EnforcerBlockerType> o_sup, o_seam, o_mmu, o_fuzzy;
+    reproj_per_face_states(old_mesh, this->supported_facets,        o_sup);
+    reproj_per_face_states(old_mesh, this->seam_facets,             o_seam);
+    reproj_per_face_states(old_mesh, this->mmu_segmentation_facets, o_mmu);
+    reproj_per_face_states(old_mesh, this->fuzzy_skin_facets,       o_fuzzy);
+    this->set_mesh(std::move(mesh_in));
+    reproj_transfer(old_mesh, this->mesh(), o_sup, o_seam, o_mmu, o_fuzzy,
+                    this->supported_facets, this->seam_facets,
+                    this->mmu_segmentation_facets, this->fuzzy_skin_facets);
+}
+
+void ModelVolume::reproject_paint_from(const ModelVolume &src)
+{
+    const TriangleMesh &old_mesh = src.mesh();
+    std::vector<EnforcerBlockerType> o_sup, o_seam, o_mmu, o_fuzzy;
+    reproj_per_face_states(old_mesh, src.supported_facets,        o_sup);
+    reproj_per_face_states(old_mesh, src.seam_facets,             o_seam);
+    reproj_per_face_states(old_mesh, src.mmu_segmentation_facets, o_mmu);
+    reproj_per_face_states(old_mesh, src.fuzzy_skin_facets,       o_fuzzy);
+    reproj_transfer(old_mesh, this->mesh(), o_sup, o_seam, o_mmu, o_fuzzy,
+                    this->supported_facets, this->seam_facets,
+                    this->mmu_segmentation_facets, this->fuzzy_skin_facets);
+}
+
+void ModelVolume::reproject_paint_from_volumes(const std::vector<std::pair<const ModelVolume*, Transform3d>> &srcs)
+{
+    // Build one combined source mesh in THIS volume's frame, with per-face
+    // dominant states accumulated in the same face order (transforms preserve
+    // face count/order, and its_merge appends faces without reindexing).
+    { std::ofstream _d("C:\\Users\\Mike\\booldbg.txt", std::ios::app);
+      _d << "BOOLDBG === reproject_paint_from_volumes ENTER srcs=" << srcs.size()
+         << " this_faces=" << this->mesh().its.indices.size() << "\n"; }
+    TriangleMesh combined;
+    std::vector<EnforcerBlockerType> o_sup, o_seam, o_mmu, o_fuzzy;
+    for (const auto &pr : srcs) {
+        const ModelVolume *sv = pr.first;
+        if (sv == nullptr || sv->mesh().its.indices.empty())
+            continue;
+        std::vector<EnforcerBlockerType> s_sup, s_seam, s_mmu, s_fuzzy;
+        reproj_per_face_states(sv->mesh(), sv->supported_facets,        s_sup);
+        reproj_per_face_states(sv->mesh(), sv->seam_facets,             s_seam);
+        reproj_per_face_states(sv->mesh(), sv->mmu_segmentation_facets, s_mmu);
+        reproj_per_face_states(sv->mesh(), sv->fuzzy_skin_facets,       s_fuzzy);
+        // Boolean fuses every source part into ONE volume that can carry only a single
+        // base filament. A part colored via the filament dropdown (whole-part extruder,
+        // NOT brush paint) has an empty mmu layer, so without this it collapses to one
+        // color. Bake each source's base filament into its UNPAINTED faces as explicit
+        // mmu paint, so every region keeps its color on the fused result. Brush-painted
+        // faces already hold their own extruder and are left untouched.
+        {
+            const int base = sv->extruder_id();
+            int brushed=0; for (auto s : s_mmu) if (s != EnforcerBlockerType::NONE) ++brushed;
+            { std::ofstream _d("C:\\Users\\Mike\\booldbg.txt", std::ios::app);
+              _d << "BOOLDBG src faces=" << s_mmu.size() << " base_extruder=" << base
+                 << " brushed_faces=" << brushed << "\n"; }
+            if (base >= 1 && base <= (int)EnforcerBlockerType::ExtruderMax) {
+                const EnforcerBlockerType base_state = static_cast<EnforcerBlockerType>(base);
+                for (EnforcerBlockerType &st : s_mmu)
+                    if (st == EnforcerBlockerType::NONE) st = base_state;
+            }
+        }
+        TriangleMesh m = sv->mesh();
+        m.transform(pr.second, true);
+        combined.merge(m);
+        o_sup.insert(o_sup.end(),     s_sup.begin(),   s_sup.end());
+        o_seam.insert(o_seam.end(),   s_seam.begin(),  s_seam.end());
+        o_mmu.insert(o_mmu.end(),     s_mmu.begin(),   s_mmu.end());
+        o_fuzzy.insert(o_fuzzy.end(), s_fuzzy.begin(), s_fuzzy.end());
+    }
+    reproj_transfer(combined, this->mesh(), o_sup, o_seam, o_mmu, o_fuzzy,
+                    this->supported_facets, this->seam_facets,
+                    this->mmu_segmentation_facets, this->fuzzy_skin_facets);
+}
+// ------------------------------------------------------------------------------
 
 ModelMaterial* ModelVolume::material() const
 {
@@ -3449,10 +3695,19 @@ size_t ModelVolume::split(unsigned int max_extruders, float scale_det)
     unsigned int extruder_counter = 0;
     const Vec3d offset = this->get_offset();
     std::vector<std::string> tris_split_strs;
+    // BBS: also carry support/seam/fuzzy-skin painting across the split (the
+    // ships[] relationship maps each split face back to its source face).
+    std::vector<std::string> tris_sup_strs, tris_seam_strs, tris_fuzzy_strs;
     auto face_count = m_mesh->its.indices.size();
     tris_split_strs.reserve(face_count);
+    tris_sup_strs.reserve(face_count);
+    tris_seam_strs.reserve(face_count);
+    tris_fuzzy_strs.reserve(face_count);
     for (size_t i = 0; i < face_count; i++) {
         tris_split_strs.emplace_back(mmu_segmentation_facets.get_triangle_as_string(i));
+        tris_sup_strs.emplace_back(supported_facets.get_triangle_as_string(i));
+        tris_seam_strs.emplace_back(seam_facets.get_triangle_as_string(i));
+        tris_fuzzy_strs.emplace_back(fuzzy_skin_facets.get_triangle_as_string(i));
     }
     int last_all_mesh_face_count = 0;
     for (TriangleMesh &mesh : meshes) {
@@ -3478,9 +3733,14 @@ size_t ModelVolume::split(unsigned int max_extruders, float scale_det)
             for (size_t i = 0; i < cur_face_count; i++) {
                 if (ships[idx].find(i) != ships[idx].end()) {
                     auto index = ships[idx][i];
-                    if (tris_split_strs[index].size() > 0) {
+                    if (tris_split_strs[index].size() > 0)
                         mmu_segmentation_facets.set_triangle_from_string(i, tris_split_strs[index]);
-                    }
+                    if (tris_sup_strs[index].size() > 0)
+                        supported_facets.set_triangle_from_string(i, tris_sup_strs[index]);
+                    if (tris_seam_strs[index].size() > 0)
+                        seam_facets.set_triangle_from_string(i, tris_seam_strs[index]);
+                    if (tris_fuzzy_strs[index].size() > 0)
+                        fuzzy_skin_facets.set_triangle_from_string(i, tris_fuzzy_strs[index]);
                 }
             }
         } else {
@@ -3489,9 +3749,14 @@ size_t ModelVolume::split(unsigned int max_extruders, float scale_det)
             for (size_t i = 0; i < new_mv->mesh_ptr()->its.indices.size(); i++) {
                 if (ships[idx].find(i) != ships[idx].end()) {
                     auto index = ships[idx][i];
-                    if (tris_split_strs[index].size() > 0) {
+                    if (tris_split_strs[index].size() > 0)
                         new_mv->mmu_segmentation_facets.set_triangle_from_string(i, tris_split_strs[index]);
-                    }
+                    if (tris_sup_strs[index].size() > 0)
+                        new_mv->supported_facets.set_triangle_from_string(i, tris_sup_strs[index]);
+                    if (tris_seam_strs[index].size() > 0)
+                        new_mv->seam_facets.set_triangle_from_string(i, tris_seam_strs[index]);
+                    if (tris_fuzzy_strs[index].size() > 0)
+                        new_mv->fuzzy_skin_facets.set_triangle_from_string(i, tris_fuzzy_strs[index]);
                 }
             }
         }

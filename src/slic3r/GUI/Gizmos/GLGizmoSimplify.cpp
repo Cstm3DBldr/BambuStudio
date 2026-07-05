@@ -544,17 +544,21 @@ void GLGizmoSimplify::process()
 
 void GLGizmoSimplify::apply_simplify() {
 
+    // BBS: decimation rebuilds the mesh; warn that painting is transferred approximately.
+    if (!wxGetApp().confirm_mesh_paint_warning())
+        return;
+
     const Selection& selection = m_parent.get_selection();
     int object_idx = selection.get_object_idx();
 
     auto plater = wxGetApp().plater();
     plater->take_snapshot(GUI::format("Simplify %1%", m_volume->name));
-    plater->clear_before_change_mesh(object_idx);
+    // BBS: do NOT wipe painting; set_mesh_keep_paint re-projects it (best-effort).
 
     ModelVolume* mv = get_model_volume(selection, wxGetApp().model());
     assert(mv == m_volume);
 
-    mv->set_mesh(std::move(*m_state.result));
+    mv->set_mesh_keep_paint(Slic3r::TriangleMesh(std::move(*m_state.result)));
     m_state.result.reset();
     mv->calculate_convex_hull();
     mv->invalidate_convex_hull_2d();
