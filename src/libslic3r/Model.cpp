@@ -3177,8 +3177,37 @@ static void reproj_apply_states(const TriangleMesh &mesh,
     if (any) out.set(sel);
 }
 
-// Map each face of new_mesh to the nearest face of old_mesh (by centroid), then
-// transfer the four precomputed old per-face state vectors onto new annotations.
+// Pick the dominant (most frequent) non-NONE state from a small candidate list.
+// Returns NONE only when every candidate is NONE (or the list is empty), so a
+// single painted sample is enough to keep paint, while conflicting samples fall
+// to the majority instead of whichever happened to be nearest the centroid.
+static EnforcerBlockerType reproj_dominant(const std::vector<EnforcerBlockerType> &cand)
+{
+    EnforcerBlockerType best = EnforcerBlockerType::NONE;
+    int best_count = 0;
+    for (size_t i = 0; i < cand.size(); ++i) {
+        if (cand[i] == EnforcerBlockerType::NONE) continue;
+        int c = 0;
+        for (size_t j = 0; j < cand.size(); ++j)
+            if (cand[j] == cand[i]) ++c;
+        if (c > best_count) { best_count = c; best = cand[i]; }
+    }
+    return best;
+}
+
+// Map each face of new_mesh to the nearest face(s) of old_mesh, then transfer the
+// four precomputed old per-face state vectors onto new annotations.
+//
+// Robustness: a failed boolean can hand back a NON-empty but malformed mesh whose
+// face indices point past its own vertex list. Reading new_mesh.its.vertices[idx]
+// unchecked in that state is an out-of-bounds read -> hard crash. Every vertex
+// access below is bounds-guarded so a malformed result silently transfers no paint
+// instead of crashing the app.
+//
+// Fidelity: instead of a single centroid sample we sample the centroid plus the
+// three edge midpoints and take the dominant state, and we reject matches farther
+// than 2% of the old mesh's bounding-box diagonal so brand-new boolean surfaces
+// (far from any old face) stay unpainted rather than snapping to a distant color.
 static void reproj_transfer(const TriangleMesh &old_mesh, const TriangleMesh &new_mesh,
                             const std::vector<EnforcerBlockerType> &o_sup,
                             const std::vector<EnforcerBlockerType> &o_seam,
@@ -3188,23 +3217,48 @@ static void reproj_transfer(const TriangleMesh &old_mesh, const TriangleMesh &ne
                             FacetsAnnotation &d_mmu, FacetsAnnotation &d_fuzzy)
 {
     d_sup.reset(); d_seam.reset(); d_mmu.reset(); d_fuzzy.reset();
-    if (old_mesh.its.indices.empty() || new_mesh.its.indices.empty()) return;
+    if (old_mesh.its.indices.empty()  || new_mesh.its.indices.empty() ||
+        old_mesh.its.vertices.empty() || new_mesh.its.vertices.empty()) return;
     auto tree = AABBTreeIndirect::build_aabb_tree_over_indexed_triangle_set(
         old_mesh.its.vertices, old_mesh.its.indices);
-    const int nf = (int)new_mesh.its.indices.size();
+    const int nf  = (int)new_mesh.its.indices.size();
+    const int nnv = (int)new_mesh.its.vertices.size();
+
+    // Reject matches farther than 2% of the old mesh's bounding-box diagonal.
+    Vec3f bbmin = old_mesh.its.vertices.front(), bbmax = bbmin;
+    for (const Vec3f &v : old_mesh.its.vertices) { bbmin = bbmin.cwiseMin(v); bbmax = bbmax.cwiseMax(v); }
+    const double diag    = (bbmax - bbmin).cast<double>().norm();
+    const double cutoff  = 0.02 * diag;
+    const double cutoff2 = cutoff * cutoff;
+
     std::vector<EnforcerBlockerType> n_sup(nf, EnforcerBlockerType::NONE), n_seam = n_sup, n_mmu = n_sup, n_fuzzy = n_sup;
+    std::vector<EnforcerBlockerType> c_sup, c_seam, c_mmu, c_fuzzy;
     for (int f = 0; f < nf; ++f) {
         const Vec3i &idx = new_mesh.its.indices[f];
-        Vec3f c = (new_mesh.its.vertices[idx[0]] + new_mesh.its.vertices[idx[1]] + new_mesh.its.vertices[idx[2]]) / 3.f;
-        size_t hit = size_t(-1);
-        Vec3f hp;
-        double d2 = AABBTreeIndirect::squared_distance_to_indexed_triangle_set(
-            old_mesh.its.vertices, old_mesh.its.indices, tree, c, hit, hp);
-        if (d2 < 0. || hit == size_t(-1) || hit >= o_sup.size()) continue;
-        n_sup[f]   = o_sup[hit];
-        n_seam[f]  = o_seam[hit];
-        n_mmu[f]   = o_mmu[hit];
-        n_fuzzy[f] = o_fuzzy[hit];
+        // Guard against a malformed boolean result (indices past the vertex list).
+        if (idx[0] < 0 || idx[1] < 0 || idx[2] < 0 ||
+            idx[0] >= nnv || idx[1] >= nnv || idx[2] >= nnv) continue;
+        const Vec3f &v0 = new_mesh.its.vertices[idx[0]];
+        const Vec3f &v1 = new_mesh.its.vertices[idx[1]];
+        const Vec3f &v2 = new_mesh.its.vertices[idx[2]];
+        // Sample the centroid plus the three edge midpoints, then take the dominant.
+        const Vec3f samples[4] = { (v0 + v1 + v2) / 3.f, (v0 + v1) * 0.5f, (v1 + v2) * 0.5f, (v2 + v0) * 0.5f };
+        c_sup.clear(); c_seam.clear(); c_mmu.clear(); c_fuzzy.clear();
+        for (const Vec3f &s : samples) {
+            size_t hit = size_t(-1);
+            Vec3f hp;
+            double d2 = AABBTreeIndirect::squared_distance_to_indexed_triangle_set(
+                old_mesh.its.vertices, old_mesh.its.indices, tree, s, hit, hp);
+            if (d2 < 0. || d2 > cutoff2 || hit == size_t(-1) || hit >= o_sup.size()) continue;
+            c_sup.push_back(o_sup[hit]);
+            c_seam.push_back(o_seam[hit]);
+            c_mmu.push_back(o_mmu[hit]);
+            c_fuzzy.push_back(o_fuzzy[hit]);
+        }
+        n_sup[f]   = reproj_dominant(c_sup);
+        n_seam[f]  = reproj_dominant(c_seam);
+        n_mmu[f]   = reproj_dominant(c_mmu);
+        n_fuzzy[f] = reproj_dominant(c_fuzzy);
     }
     reproj_apply_states(new_mesh, n_sup,   d_sup);
     reproj_apply_states(new_mesh, n_seam,  d_seam);
@@ -3255,6 +3309,20 @@ void ModelVolume::reproject_paint_from_volumes(const std::vector<std::pair<const
         reproj_per_face_states(sv->mesh(), sv->seam_facets,             s_seam);
         reproj_per_face_states(sv->mesh(), sv->mmu_segmentation_facets, s_mmu);
         reproj_per_face_states(sv->mesh(), sv->fuzzy_skin_facets,       s_fuzzy);
+        // Boolean fuses every source part into ONE volume that can carry only a single
+        // base filament. A part colored via the filament dropdown (whole-part extruder,
+        // NOT brush paint) has an empty mmu layer, so without this it collapses to one
+        // color. Bake each source's base filament into its UNPAINTED faces as explicit
+        // mmu paint, so every region keeps its color on the fused result. Brush-painted
+        // faces already hold their own extruder and are left untouched.
+        {
+            const int base = sv->extruder_id();
+            if (base >= 1 && base <= (int)EnforcerBlockerType::ExtruderMax) {
+                const EnforcerBlockerType base_state = static_cast<EnforcerBlockerType>(base);
+                for (EnforcerBlockerType &st : s_mmu)
+                    if (st == EnforcerBlockerType::NONE) st = base_state;
+            }
+        }
         TriangleMesh m = sv->mesh();
         m.transform(pr.second, true);
         combined.merge(m);

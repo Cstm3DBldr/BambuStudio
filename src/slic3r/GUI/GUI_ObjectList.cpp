@@ -3443,11 +3443,29 @@ void ObjectList::boolean()
     // the sources are projected with their own matrices to match. Must run
     // before center_around_origin() shifts the mesh.
     {
+        // combine_mesh_fff(object, -1, ...) bakes the object's instance transform
+        // into the union result (Plater.cpp: mesh.transform(instance->get_matrix())),
+        // so the union lives in world/plate coordinates. Rebuild the source meshes in
+        // that SAME frame by prepending the instance matrix - otherwise every union
+        // face sits ~100 mm from the object-space sources, past the match cutoff, and
+        // all paint is dropped (the union comes out one solid color). Single-instance
+        // is the norm; for multiple instances the first instance's copy is matched.
+        const Transform3d inst = object->instances.empty()
+            ? Transform3d::Identity()
+            : object->instances.front()->get_matrix();
         std::vector<std::pair<const ModelVolume*, Transform3d>> bsrcs;
         for (const ModelVolume* v : object->volumes)
             if (v->is_model_part())
-                bsrcs.emplace_back(v, v->get_matrix());
-        new_volume->reproject_paint_from_volumes(bsrcs);
+                bsrcs.emplace_back(v, inst * v->get_matrix());
+        // Best-effort: a degenerate boolean result must never take down the app.
+        // Losing the paint transfer is acceptable; crashing is not.
+        try {
+            new_volume->reproject_paint_from_volumes(bsrcs);
+        } catch (const std::exception &e) {
+            BOOST_LOG_TRIVIAL(error) << "boolean paint transfer skipped: " << e.what();
+        } catch (...) {
+            BOOST_LOG_TRIVIAL(error) << "boolean paint transfer skipped: unknown error";
+        }
     }
 
     // BBS: ensure on bed but no need to ensure locate in the center around origin
