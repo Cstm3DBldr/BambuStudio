@@ -3426,8 +3426,21 @@ void ObjectList::boolean()
 
     Plater::TakeSnapshot snapshot(wxGetApp().plater(), "boolean");
 
+    // Boolean runs synchronously on the UI thread and can take a while (mcut has to resolve
+    // the CSG, especially on self-intersecting meshes) followed by the paint transfer. Show a
+    // progress popup with phase text so it does not look like a silent freeze. Matches the
+    // "Repairing model object" dialog (same flags + adaptive sizing + two-line message) for a
+    // uniform look: line 1 names the operation + object, line 2 is the current phase.
+    const wxString bool_msg = _L("Boolean operation") + ": " + from_u8((*m_objects)[obj_idxs.front()]->name) + "\n";
+    ProgressDialog progress_dlg(_L("Boolean operation"), bool_msg + _L("Combining meshes..."), 100,
+                                find_toplevel_parent(wxGetApp().plater()),
+                                wxPD_AUTO_HIDE | wxPD_APP_MODAL | wxPD_CAN_ABORT, true);
+    progress_dlg.Update(5, bool_msg + _L("Combining meshes..."));
+
     ModelObject* object = (*m_objects)[obj_idxs.front()];
     TriangleMesh mesh = Plater::combine_mesh_fff(*object, -1, [this](const std::string &msg) { return wxGetApp().notification_manager()->push_plater_warning_notification(msg); });
+
+    progress_dlg.Update(55, bool_msg + _L("Transferring paint..."));
 
     // add mesh to model as a new object, keep the original object's name and config
     Model* model = object->get_model();
@@ -3466,13 +3479,21 @@ void ObjectList::boolean()
         // Best-effort: a degenerate boolean result must never take down the app.
         // Losing the paint transfer is acceptable; crashing is not.
         try {
-            new_volume->reproject_paint_from_volumes(bsrcs);
+            // Map the transfer's 0..100 onto the dialog's 55..90 band. Each Update() also
+            // services the UI message queue, so the app keeps responding during a long transfer
+            // instead of going "not responding". Update() returns false if the user hit Cancel,
+            // which stops the (best-effort) transfer early - the union geometry is already valid.
+            new_volume->reproject_paint_from_volumes(bsrcs, [&progress_dlg, &bool_msg](int pct) {
+                return progress_dlg.Update(55 + pct * 35 / 100, bool_msg + _L("Transferring paint..."));
+            });
         } catch (const std::exception &e) {
             BOOST_LOG_TRIVIAL(error) << "boolean paint transfer skipped: " << e.what();
         } catch (...) {
             BOOST_LOG_TRIVIAL(error) << "boolean paint transfer skipped: unknown error";
         }
     }
+
+    progress_dlg.Update(90, bool_msg + _L("Updating scene..."));
 
     // BBS: ensure on bed but no need to ensure locate in the center around origin
     new_object->ensure_on_bed();
@@ -3490,6 +3511,8 @@ void ObjectList::boolean()
     add_object_to_list(m_objects->size() - 1);
     select_item(m_objects_model->GetItemById(m_objects->size() - 1));
     update_selections_on_canvas();
+
+    progress_dlg.Update(100, wxEmptyString);
 }
 
 wxDataViewItem ObjectList::add_layer_root_item(const wxDataViewItem obj_item)

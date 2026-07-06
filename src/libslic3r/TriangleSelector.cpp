@@ -1007,7 +1007,8 @@ EnforcerBlockerType TriangleSelector::state_at(const Vec3f &hit, int facet_idx) 
     return m_triangles[leaf].get_state();
 }
 
-void TriangleSelector::paint_by_sampler(const std::function<EnforcerBlockerType(const Vec3f &)> &sampler, float edge_limit)
+void TriangleSelector::paint_by_sampler(const std::function<EnforcerBlockerType(const Vec3f &)> &sampler, float edge_limit,
+                                        const std::function<bool(int, int)> &progress)
 {
     this->reset();
     this->set_edge_limit(edge_limit);
@@ -1020,7 +1021,11 @@ void TriangleSelector::paint_by_sampler(const std::function<EnforcerBlockerType(
             continue;
         this->paint_triangle_by_sampler(i, m_neighbors[i], sampler, 0);
         this->remove_useless_children(i);
+        if (progress && (i & 255) == 0 && !progress(i, m_orig_size_indices))
+            break; // caller cancelled
     }
+    if (progress)
+        progress(m_orig_size_indices, m_orig_size_indices);
     this->garbage_collect();
 }
 

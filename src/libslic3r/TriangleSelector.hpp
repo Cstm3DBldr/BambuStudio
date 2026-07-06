@@ -275,7 +275,11 @@ public:
     // local coordinates) across every face, subdividing ONLY where the sampled state
     // varies, down to `edge_limit`. Clears any existing paint first. This lets a coarse
     // boolean-result mesh carry fine per-triangle paint without bloating uniform areas.
-    void paint_by_sampler(const std::function<EnforcerBlockerType(const Vec3f &)> &sampler, float edge_limit);
+    // `progress(done, total)`, if set, is called periodically over the original faces so a
+    // caller can drive a progress bar (and keep the UI thread's message queue serviced).
+    // If it returns false the sampling stops early (leaving remaining faces unpainted).
+    void paint_by_sampler(const std::function<EnforcerBlockerType(const Vec3f &)> &sampler, float edge_limit,
+                          const std::function<bool(int, int)> &progress = {});
 
     // Clear everything and make the tree empty.
     void reset();

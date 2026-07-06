@@ -1000,7 +1000,11 @@ public:
     // BBS: multi-source variant for boolean union/merge of several volumes. Each
     // source mesh is transformed by its paired matrix into this volume's frame,
     // then nearest-surface lookup carries all four paint layers.
-    void                reproject_paint_from_volumes(const std::vector<std::pair<const ModelVolume*, Transform3d>> &srcs);
+    // `progress(percent)`, if set, is called periodically (0..100) so the caller can drive a
+    // progress bar and keep the UI responsive during a long transfer. Return false to cancel
+    // the (best-effort) transfer early.
+    void                reproject_paint_from_volumes(const std::vector<std::pair<const ModelVolume*, Transform3d>> &srcs,
+                                                     const std::function<bool(int)> &progress = {});
     ModelMaterial*      material() const;
     void                set_material(t_model_material_id material_id, const ModelMaterial &material);
     // Extract the current extruder ID based on this ModelVolume's config and the parent ModelObject's config.

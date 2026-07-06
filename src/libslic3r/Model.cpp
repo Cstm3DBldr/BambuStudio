@@ -3324,7 +3324,8 @@ void ModelVolume::reproject_paint_from(const ModelVolume &src)
                     this->mmu_segmentation_facets, this->fuzzy_skin_facets, /*exact=*/false);
 }
 
-void ModelVolume::reproject_paint_from_volumes(const std::vector<std::pair<const ModelVolume*, Transform3d>> &srcs)
+void ModelVolume::reproject_paint_from_volumes(const std::vector<std::pair<const ModelVolume*, Transform3d>> &srcs,
+                                               const std::function<bool(int)> &progress)
 {
     // High-fidelity paint transfer. The old path flattened every source face and every
     // result face to ONE dominant color, so hand-painted brush detail smaller than a base
@@ -3424,9 +3425,22 @@ void ModelVolume::reproject_paint_from_volumes(const std::vector<std::pair<const
     // 0.2 mm matches the finest edge the brush itself paints, so even thin brush strokes
     // survive; uniform regions stay a single triangle so the mesh does not bloat.
     const float edge_limit = 0.2f;
+    // Spread the progress bar evenly across the layers we actually run.
+    const int active_layers = 1 + (any_sup ? 1 : 0) + (any_seam ? 1 : 0) + (any_fuzzy ? 1 : 0);
+    int       layer_ord     = 0;
+    bool      cancelled     = false;
     auto apply = [&](Layer layer, FacetsAnnotation &dst) {
+        if (cancelled) { dst.reset(); return; }
+        const int base = layer_ord++;
         TriangleSelector sel(this->mesh());
-        sel.paint_by_sampler([&, layer](const Vec3f &p) { return sample(p, layer); }, edge_limit);
+        sel.paint_by_sampler([&, layer](const Vec3f &p) { return sample(p, layer); }, edge_limit,
+            [&, base](int done, int total) -> bool {
+                if (progress && total > 0 && !progress((base * 100 + done * 100 / total) / active_layers)) {
+                    cancelled = true;
+                    return false; // stop this layer's sampling
+                }
+                return true;
+            });
         dst.reset();
         dst.set(sel);
     };
@@ -3436,6 +3450,7 @@ void ModelVolume::reproject_paint_from_volumes(const std::vector<std::pair<const
     if (any_sup)   apply(Layer::Sup,  this->supported_facets); else this->supported_facets.reset();
     if (any_seam)  apply(Layer::Seam, this->seam_facets);      else this->seam_facets.reset();
     if (any_fuzzy) apply(Layer::Fuzzy, this->fuzzy_skin_facets); else this->fuzzy_skin_facets.reset();
+    if (progress) progress(100);
 }
 // ------------------------------------------------------------------------------
 
