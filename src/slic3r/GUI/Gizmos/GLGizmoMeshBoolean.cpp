@@ -1384,8 +1384,10 @@ ModelVolume* BooleanOperationEngine::create_result_volume(ModelObject* target_ob
 
     // Copy the transformation from source volume
     new_volume->set_transformation(source_volume->get_transformation());
-    // BBS: best-effort transfer of painting from the source onto the boolean result.
-    new_volume->reproject_paint_from(*source_volume);
+    // Transfer painting from the source onto the boolean result using the high-fidelity
+    // per-triangle sampler (same path as the right-click Boolean). The result mesh is already
+    // in the source volume's local frame here, so the source-to-result transform is identity.
+    new_volume->reproject_paint_from_volumes({ { source_volume, Transform3d::Identity() } });
     return new_volume;
 }
 
