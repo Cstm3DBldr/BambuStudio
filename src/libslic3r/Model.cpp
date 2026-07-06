@@ -3422,10 +3422,11 @@ void ModelVolume::reproject_paint_from_volumes(const std::vector<std::pair<const
         return st;
     };
 
-    // Finer than the brush's own 0.2mm: subdivide colour boundaries down to 0.1mm so the
-    // stair-stepping is well below the nozzle/line width and the sliced colour edge comes out
-    // smooth. Only boundary faces subdivide, so uniform regions stay cheap.
-    const float edge_limit = 0.1f;
+    // Subdivide colour boundaries down to 0.05mm - finer than the smallest layer height a
+    // 0.2mm nozzle can print (0.08mm), so the paint boundary is never the limiting factor for
+    // colour fidelity. Only boundary faces subdivide, so uniform regions stay cheap (but a
+    // heavily-painted boundary will produce a lot of triangles - watch transfer time).
+    const float edge_limit = 0.05f;
     // Spread the progress bar evenly across the layers we actually run.
     const int active_layers = 1 + (any_sup ? 1 : 0) + (any_seam ? 1 : 0) + (any_fuzzy ? 1 : 0);
     int       layer_ord     = 0;
