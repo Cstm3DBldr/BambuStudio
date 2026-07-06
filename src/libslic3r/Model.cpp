@@ -3134,17 +3134,19 @@ static EnforcerBlockerType reproj_first_leaf(TriangleSelector &sel, int root_idx
 {
     const auto &tris = sel.get_triangles();
     if (root_idx < 0 || root_idx >= (int)tris.size()) return EnforcerBlockerType::NONE;
+    const int n = (int)tris.size();
     std::queue<int> q;
     q.push(root_idx);
     while (!q.empty()) {
         int i = q.front(); q.pop();
+        if (i < 0 || i >= n) continue; // guard against a corrupt/out-of-range child index
         const auto &t = tris[i];
         if (!t.valid()) continue;
         if (!t.is_split()) {
             if (t.get_state() != EnforcerBlockerType::NONE)
                 return t.get_state();
         } else {
-            for (int c : t.children) if (c >= 0) q.push(c);
+            for (int c : t.children) if (c >= 0 && c < n) q.push(c);
         }
     }
     return EnforcerBlockerType::NONE;
@@ -3208,13 +3210,26 @@ static EnforcerBlockerType reproj_dominant(const std::vector<EnforcerBlockerType
 // three edge midpoints and take the dominant state, and we reject matches farther
 // than 2% of the old mesh's bounding-box diagonal so brand-new boolean surfaces
 // (far from any old face) stay unpainted rather than snapping to a distant color.
+// Transfer per-face paint states from old_mesh onto new_mesh by nearest-face lookup.
+//
+// `exact` selects the matching policy, because the two callers want opposite things:
+//  - exact=false (boolean / cut, where the mesh is rebuilt coarsely and brand-new surfaces
+//    appear): sample the centroid + 3 edge midpoints and take the dominant NON-empty state,
+//    and reject matches farther than 2% of the bbox diagonal. This keeps paint alive across
+//    a coarse remesh and leaves genuinely new surfaces unpainted.
+//  - exact=true (repair / simplify, where the mesh barely changes): take the state of the
+//    single nearest face at the centroid, EXACTLY (including "unpainted"), with no distance
+//    cutoff. The 4-sample dominant-non-empty vote would bleed painted regions outward by ~one
+//    face-width along every boundary during repair; the exact single sample does not. This is
+//    the behavior of the merged upstream PR.
 static void reproj_transfer(const TriangleMesh &old_mesh, const TriangleMesh &new_mesh,
                             const std::vector<EnforcerBlockerType> &o_sup,
                             const std::vector<EnforcerBlockerType> &o_seam,
                             const std::vector<EnforcerBlockerType> &o_mmu,
                             const std::vector<EnforcerBlockerType> &o_fuzzy,
                             FacetsAnnotation &d_sup, FacetsAnnotation &d_seam,
-                            FacetsAnnotation &d_mmu, FacetsAnnotation &d_fuzzy)
+                            FacetsAnnotation &d_mmu, FacetsAnnotation &d_fuzzy,
+                            bool exact)
 {
     d_sup.reset(); d_seam.reset(); d_mmu.reset(); d_fuzzy.reset();
     if (old_mesh.its.indices.empty()  || new_mesh.its.indices.empty() ||
@@ -3224,29 +3239,43 @@ static void reproj_transfer(const TriangleMesh &old_mesh, const TriangleMesh &ne
     const int nf  = (int)new_mesh.its.indices.size();
     const int nnv = (int)new_mesh.its.vertices.size();
 
-    // Reject matches farther than 2% of the old mesh's bounding-box diagonal.
-    Vec3f bbmin = old_mesh.its.vertices.front(), bbmax = bbmin;
-    for (const Vec3f &v : old_mesh.its.vertices) { bbmin = bbmin.cwiseMin(v); bbmax = bbmax.cwiseMax(v); }
-    const double diag    = (bbmax - bbmin).cast<double>().norm();
-    const double cutoff  = 0.02 * diag;
-    const double cutoff2 = cutoff * cutoff;
+    // Only used by the boolean/cut (inexact) path: reject matches farther than 2% of the
+    // old mesh's bounding-box diagonal.
+    double cutoff2 = std::numeric_limits<double>::max();
+    if (!exact) {
+        Vec3f bbmin = old_mesh.its.vertices.front(), bbmax = bbmin;
+        for (const Vec3f &v : old_mesh.its.vertices) { bbmin = bbmin.cwiseMin(v); bbmax = bbmax.cwiseMax(v); }
+        const double diag = (bbmax - bbmin).cast<double>().norm();
+        cutoff2 = (0.02 * diag) * (0.02 * diag);
+    }
 
     std::vector<EnforcerBlockerType> n_sup(nf, EnforcerBlockerType::NONE), n_seam = n_sup, n_mmu = n_sup, n_fuzzy = n_sup;
     std::vector<EnforcerBlockerType> c_sup, c_seam, c_mmu, c_fuzzy;
     for (int f = 0; f < nf; ++f) {
         const Vec3i &idx = new_mesh.its.indices[f];
-        // Guard against a malformed boolean result (indices past the vertex list).
+        // Guard against a malformed result (indices past the vertex list).
         if (idx[0] < 0 || idx[1] < 0 || idx[2] < 0 ||
             idx[0] >= nnv || idx[1] >= nnv || idx[2] >= nnv) continue;
         const Vec3f &v0 = new_mesh.its.vertices[idx[0]];
         const Vec3f &v1 = new_mesh.its.vertices[idx[1]];
         const Vec3f &v2 = new_mesh.its.vertices[idx[2]];
-        // Sample the centroid plus the three edge midpoints, then take the dominant.
-        const Vec3f samples[4] = { (v0 + v1 + v2) / 3.f, (v0 + v1) * 0.5f, (v1 + v2) * 0.5f, (v2 + v0) * 0.5f };
+        const Vec3f centroid = (v0 + v1 + v2) / 3.f;
+
+        if (exact) {
+            // Single nearest face at the centroid; copy its state verbatim (incl. NONE).
+            size_t hit = size_t(-1); Vec3f hp;
+            double d2 = AABBTreeIndirect::squared_distance_to_indexed_triangle_set(
+                old_mesh.its.vertices, old_mesh.its.indices, tree, centroid, hit, hp);
+            if (d2 < 0. || hit == size_t(-1) || hit >= o_sup.size()) continue;
+            n_sup[f] = o_sup[hit]; n_seam[f] = o_seam[hit]; n_mmu[f] = o_mmu[hit]; n_fuzzy[f] = o_fuzzy[hit];
+            continue;
+        }
+
+        // Boolean/cut: sample the centroid + 3 edge midpoints, take the dominant non-empty state.
+        const Vec3f samples[4] = { centroid, (v0 + v1) * 0.5f, (v1 + v2) * 0.5f, (v2 + v0) * 0.5f };
         c_sup.clear(); c_seam.clear(); c_mmu.clear(); c_fuzzy.clear();
         for (const Vec3f &s : samples) {
-            size_t hit = size_t(-1);
-            Vec3f hp;
+            size_t hit = size_t(-1); Vec3f hp;
             double d2 = AABBTreeIndirect::squared_distance_to_indexed_triangle_set(
                 old_mesh.its.vertices, old_mesh.its.indices, tree, s, hit, hp);
             if (d2 < 0. || d2 > cutoff2 || hit == size_t(-1) || hit >= o_sup.size()) continue;
@@ -3275,9 +3304,10 @@ void ModelVolume::set_mesh_keep_paint(TriangleMesh &&mesh_in)
     reproj_per_face_states(old_mesh, this->mmu_segmentation_facets, o_mmu);
     reproj_per_face_states(old_mesh, this->fuzzy_skin_facets,       o_fuzzy);
     this->set_mesh(std::move(mesh_in));
+    // Repair / Simplify barely change the mesh -> exact nearest-face transfer, no paint bleed.
     reproj_transfer(old_mesh, this->mesh(), o_sup, o_seam, o_mmu, o_fuzzy,
                     this->supported_facets, this->seam_facets,
-                    this->mmu_segmentation_facets, this->fuzzy_skin_facets);
+                    this->mmu_segmentation_facets, this->fuzzy_skin_facets, /*exact=*/true);
 }
 
 void ModelVolume::reproject_paint_from(const ModelVolume &src)
@@ -3288,9 +3318,10 @@ void ModelVolume::reproject_paint_from(const ModelVolume &src)
     reproj_per_face_states(old_mesh, src.seam_facets,             o_seam);
     reproj_per_face_states(old_mesh, src.mmu_segmentation_facets, o_mmu);
     reproj_per_face_states(old_mesh, src.fuzzy_skin_facets,       o_fuzzy);
+    // Boolean/cut gizmo: coarse remesh + brand-new surfaces -> paint-biased sampling + cutoff.
     reproj_transfer(old_mesh, this->mesh(), o_sup, o_seam, o_mmu, o_fuzzy,
                     this->supported_facets, this->seam_facets,
-                    this->mmu_segmentation_facets, this->fuzzy_skin_facets);
+                    this->mmu_segmentation_facets, this->fuzzy_skin_facets, /*exact=*/false);
 }
 
 void ModelVolume::reproject_paint_from_volumes(const std::vector<std::pair<const ModelVolume*, Transform3d>> &srcs)
@@ -3310,6 +3341,9 @@ void ModelVolume::reproject_paint_from_volumes(const std::vector<std::pair<const
     };
     std::vector<SrcVol> vols;
     TriangleMesh        combined; // every source BASE mesh, merged, in THIS (union) volume's frame
+    // Which paint layers any source actually uses - so we can skip sampling a layer nobody
+    // painted (a big speed-up: most models only use mmu, so we skip 3 of 4 layers).
+    bool any_sup = false, any_seam = false, any_fuzzy = false;
 
     for (const auto &pr : srcs) {
         const ModelVolume *sv = pr.first;
@@ -3328,6 +3362,9 @@ void ModelVolume::reproject_paint_from_volumes(const std::vector<std::pair<const
         sd.sel_sup   = make_sel(sv->supported_facets);
         sd.sel_seam  = make_sel(sv->seam_facets);
         sd.sel_fuzzy = make_sel(sv->fuzzy_skin_facets);
+        any_sup   |= !sv->supported_facets.empty();
+        any_seam  |= !sv->seam_facets.empty();
+        any_fuzzy |= !sv->fuzzy_skin_facets.empty();
 
         TriangleMesh m = sv->mesh();
         m.transform(pr.second, true);
@@ -3393,10 +3430,12 @@ void ModelVolume::reproject_paint_from_volumes(const std::vector<std::pair<const
         dst.reset();
         dst.set(sel);
     };
-    apply(Layer::Sup,   this->supported_facets);
-    apply(Layer::Seam,  this->seam_facets);
-    apply(Layer::Mmu,   this->mmu_segmentation_facets);
-    apply(Layer::Fuzzy, this->fuzzy_skin_facets);
+    // mmu always runs (it also carries each part's base filament); the other three only
+    // if someone actually painted them, otherwise just clear them.
+    apply(Layer::Mmu, this->mmu_segmentation_facets);
+    if (any_sup)   apply(Layer::Sup,  this->supported_facets); else this->supported_facets.reset();
+    if (any_seam)  apply(Layer::Seam, this->seam_facets);      else this->seam_facets.reset();
+    if (any_fuzzy) apply(Layer::Fuzzy, this->fuzzy_skin_facets); else this->fuzzy_skin_facets.reset();
 }
 // ------------------------------------------------------------------------------
 
