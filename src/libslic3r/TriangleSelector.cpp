@@ -1148,19 +1148,24 @@ void TriangleSelector::paint_triangle_by_sampler(int facet_idx, const Vec3i &nei
     const float max_edge2  = std::max({(a - b).squaredNorm(), (b - c).squaredNorm(), (c - a).squaredNorm()});
     const float edge_limit = std::sqrt(m_edge_limit_sqr);
     const bool  can_split  = max_edge2 > m_edge_limit_sqr && depth < MAX_DEPTH;
+    const Vec3f centroid   = (a + b + c) * (1.f / 3.f);
 
-    // Detection grid resolution: spacing ~= edge_limit so painted features down to the
-    // target fidelity trigger a split. Denser on bigger triangles, capped so a huge flat
-    // face doesn't sample thousands of points.
+    // Fast path: a triangle we can't (or won't) subdivide is small enough that a single
+    // centroid sample represents it. At a fine edge limit the finest triangles vastly dominate
+    // the count, so sampling them ONCE (instead of on a full grid) is the main cost saver.
+    if (!can_split) {
+        this->undivide_triangle(facet_idx);
+        m_triangles[facet_idx].set_state(sampler(centroid));
+        return;
+    }
+
+    // Splittable: sample a detection grid (spacing ~= edge_limit) and bail on the FIRST colour
+    // change - one mismatch is enough to know we must subdivide.
     const int res = std::clamp(int(std::ceil(std::sqrt(max_edge2) / std::max(edge_limit, 1e-3f))), 2, 24);
-
     auto point_at = [&](int u, int v) {
         const float bu = float(u) / float(res), bv = float(v) / float(res);
         return bu * a + bv * b + (1.f - bu - bv) * c;
     };
-
-    // Uniformity scan with early-out: on a splittable triangle, the first mismatch is enough
-    // to know we must subdivide, so bail immediately instead of sampling the whole grid.
     bool have_first = false, uniform = true;
     EnforcerBlockerType first = EnforcerBlockerType::NONE;
     for (int u = 0; u <= res && uniform; ++u)
@@ -1170,40 +1175,30 @@ void TriangleSelector::paint_triangle_by_sampler(int facet_idx, const Vec3i &nei
             else if (s != first) { uniform = false; break; }
         }
 
-    if (!uniform && can_split) {
-        if (!tr->is_split())
-            this->split_triangle(facet_idx, neighbors);
-        tr = &m_triangles[facet_idx]; // split_triangle may have reallocated m_triangles
-        // split_triangle() can DECLINE (degenerate/sliver, or edges already at the limit);
-        // the triangle then stays a leaf with uninitialized children[] - recursing would read
-        // garbage and crash. Only recurse when it actually split (the guard
-        // select_triangle_recursive() spells as `if (num_of_children != 1)`).
-        if (tr->is_split()) {
-            const int num_children = tr->number_of_split_sides() + 1;
-            for (int i = 0; i < num_children; ++i) {
-                this->paint_triangle_by_sampler(tr->children[i], this->child_neighbors(*tr, neighbors, i), sampler, depth + 1);
-                tr = &m_triangles[facet_idx];
-            }
-            return;
-        }
-        // fell through: could not split - assign as a leaf below.
+    // Uniform across the whole (still large) triangle: assign one colour, no subdivision.
+    if (uniform) {
+        this->undivide_triangle(facet_idx);
+        m_triangles[facet_idx].set_state(first);
+        return;
     }
 
-    // Leaf. Uniform -> the single sampled state. Non-uniform but unsplittable (at edge limit
-    // or depth cap) -> the dominant of a full grid sample.
-    EnforcerBlockerType state = first;
-    if (!uniform) {
-        std::map<int, int> tally;
-        for (int u = 0; u <= res; ++u)
-            for (int v = 0; u + v <= res; ++v)
-                ++tally[int(sampler(point_at(u, v)))];
-        int best_state = int(EnforcerBlockerType::NONE), best_count = 0;
-        for (const auto &kv : tally)
-            if (kv.second > best_count) { best_count = kv.second; best_state = kv.first; }
-        state = EnforcerBlockerType(best_state);
+    // Mixed: subdivide and recurse into the children.
+    if (!tr->is_split())
+        this->split_triangle(facet_idx, neighbors);
+    tr = &m_triangles[facet_idx]; // split_triangle may have reallocated m_triangles
+    // split_triangle() can DECLINE (degenerate/sliver): the triangle stays a leaf with
+    // uninitialized children[] - recursing would read garbage and crash. Only recurse when it
+    // actually split; otherwise assign it as a leaf from the centroid.
+    if (tr->is_split()) {
+        const int num_children = tr->number_of_split_sides() + 1;
+        for (int i = 0; i < num_children; ++i) {
+            this->paint_triangle_by_sampler(tr->children[i], this->child_neighbors(*tr, neighbors, i), sampler, depth + 1);
+            tr = &m_triangles[facet_idx];
+        }
+        return;
     }
     this->undivide_triangle(facet_idx);
-    m_triangles[facet_idx].set_state(state);
+    m_triangles[facet_idx].set_state(sampler(centroid));
 }
 
 // called by select_patch()->select_triangle()...select_triangle()
