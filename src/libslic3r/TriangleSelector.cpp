@@ -2,9 +2,13 @@
 #include "Model.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <functional>
 #include <map>
+#include <thread>
+#include <tbb/parallel_for.h>
+#include <tbb/blocked_range.h>
 #include <boost/container/small_vector.hpp>
 #include <boost/log/trivial.hpp>
 
@@ -1012,21 +1016,64 @@ void TriangleSelector::paint_by_sampler(const std::function<EnforcerBlockerType(
 {
     this->reset();
     this->set_edge_limit(edge_limit);
-    // Mirror select_triangle(): seed each original face from the member neighbor list
-    // (m_neighbors is per-original-face and stays valid across reset()), then collapse
-    // any children that ended up the same state. Using the wrong neighbor list corrupts
-    // the split tree inside split_triangle() and crashes.
-    for (int i = 0; i < m_orig_size_indices; ++i) {
-        if (!m_triangles[i].valid())
-            continue;
-        this->paint_triangle_by_sampler(i, m_neighbors[i], sampler, 0);
-        this->remove_useless_children(i);
-        if (progress && (i & 255) == 0 && !progress(i, m_orig_size_indices))
-            break; // caller cancelled
+    const int n = m_orig_size_indices;
+    if (n <= 0) { if (progress) progress(0, 0); return; }
+
+    // Parallel: each original face's subdivision is independent (the sampler only READS the
+    // source), so split the faces into chunks and paint each chunk on its OWN TriangleSelector.
+    // serialize() only emits data for split/painted faces, so a chunk's serialization contains
+    // just that chunk's faces -> the results merge by simple concatenation (adjusting bit
+    // offsets). Building N base trees is cheap; the AABB sampling is the cost, and it scales
+    // across cores. (Minor: adjacent chunks don't share edge midpoints, leaving benign coplanar
+    // T-junctions that don't affect the print.)
+    int hw = int(std::thread::hardware_concurrency());
+    if (hw <= 0) hw = 4;
+    const int num_chunks = std::clamp(hw * 2, 1, n);
+
+    using SerData = std::pair<std::vector<std::pair<int, int>>, std::vector<bool>>;
+    std::vector<SerData> parts(num_chunks);
+
+    // Per-chunk progress. NOTE: `progress` is invoked concurrently from worker threads here,
+    // so the caller's callback must be thread-safe (the boolean caller sets atomics).
+    std::atomic<int>  done_faces{0};
+    std::atomic<bool> cancelled{false};
+    tbb::parallel_for(tbb::blocked_range<int>(0, num_chunks), [&](const tbb::blocked_range<int> &r) {
+        for (int c = r.begin(); c < r.end(); ++c) {
+            if (cancelled.load(std::memory_order_relaxed))
+                continue;
+            const int lo = int(int64_t(c)     * n / num_chunks);
+            const int hi = int(int64_t(c + 1) * n / num_chunks);
+            TriangleSelector local(m_mesh, edge_limit);
+            local.set_edge_limit(edge_limit);
+            for (int i = lo; i < hi; ++i) {
+                if (!local.m_triangles[i].valid())
+                    continue;
+                local.paint_triangle_by_sampler(i, local.m_neighbors[i], sampler, 0);
+                local.remove_useless_children(i);
+            }
+            parts[c] = local.serialize();
+            const int d = done_faces.fetch_add(hi - lo) + (hi - lo);
+            if (progress && !progress(d, n))
+                cancelled.store(true, std::memory_order_relaxed);
+        }
+    });
+
+    // Concatenate the disjoint per-chunk serializations, fixing up bit offsets, then rebuild
+    // this selector from the merged stream.
+    SerData merged;
+    size_t bits = 0, entries = 0;
+    for (const auto &p : parts) { bits += p.second.size(); entries += p.first.size(); }
+    merged.first.reserve(entries);
+    merged.second.reserve(bits);
+    for (const auto &p : parts) {
+        const int base = int(merged.second.size());
+        for (const auto &e : p.first)
+            merged.first.emplace_back(e.first, e.second + base);
+        merged.second.insert(merged.second.end(), p.second.begin(), p.second.end());
     }
-    if (progress)
-        progress(m_orig_size_indices, m_orig_size_indices);
-    this->garbage_collect();
+    this->deserialize(merged, /*needs_reset=*/true);
+
+    if (progress) progress(n, n);
 }
 
 void TriangleSelector::despeckle(const std::vector<Vec3i> &face_neighbors)

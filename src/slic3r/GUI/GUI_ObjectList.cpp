@@ -1,5 +1,8 @@
 #include "libslic3r/libslic3r.h"
 #include "libslic3r/PresetBundle.hpp"
+#include <thread>
+#include <atomic>
+#include <chrono>
 #include "GUI_ObjectList.hpp"
 #include "GUI_Factories.hpp"
 //#include "GUI_ObjectLayers.hpp"
@@ -3488,20 +3491,38 @@ void ObjectList::boolean()
         for (const ModelVolume* v : object->volumes)
             if (v->is_model_part())
                 bsrcs.emplace_back(v, world_to_local * inst * v->get_matrix());
-        // Best-effort: a degenerate boolean result must never take down the app.
-        // Losing the paint transfer is acceptable; crashing is not.
-        try {
-            // Map the transfer's 0..100 onto the dialog's 55..90 band. Each Update() also
-            // services the UI message queue, so the app keeps responding during a long transfer
-            // instead of going "not responding". Update() returns false if the user hit Cancel,
-            // which stops the (best-effort) transfer early - the union geometry is already valid.
-            new_volume->reproject_paint_from_volumes(bsrcs, [&progress_dlg, &bool_msg](int pct) {
-                return progress_dlg.Update(55 + pct * 35 / 100, bool_msg + _L("Transferring paint..."));
+        // Run the (multi-core) paint transfer on a BACKGROUND thread so the UI thread stays free
+        // to update the progress dialog and pump the message queue - the app keeps responding
+        // instead of going "not responding" while all cores are busy. The transfer's progress
+        // callback runs on worker threads, so it only touches atomics; the UI thread polls them.
+        // Best-effort: a degenerate boolean result must never take down the app - a throw is
+        // caught and just skips the paint transfer (the union geometry is already valid).
+        {
+            std::atomic<int>   pct{0};
+            std::atomic<bool>  cancel_req{false};
+            std::atomic<bool>  finished{false};
+            std::exception_ptr worker_ex;
+            std::thread worker([&]() {
+                try {
+                    new_volume->reproject_paint_from_volumes(bsrcs, [&pct, &cancel_req](int p) {
+                        pct.store(p, std::memory_order_relaxed);
+                        return !cancel_req.load(std::memory_order_relaxed);
+                    });
+                } catch (...) { worker_ex = std::current_exception(); }
+                finished.store(true, std::memory_order_release);
             });
-        } catch (const std::exception &e) {
-            BOOST_LOG_TRIVIAL(error) << "boolean paint transfer skipped: " << e.what();
-        } catch (...) {
-            BOOST_LOG_TRIVIAL(error) << "boolean paint transfer skipped: unknown error";
+            while (!finished.load(std::memory_order_acquire)) {
+                if (!progress_dlg.Update(55 + pct.load(std::memory_order_relaxed) * 35 / 100,
+                                         bool_msg + _L("Transferring paint...")))
+                    cancel_req.store(true, std::memory_order_relaxed); // user hit Cancel
+                std::this_thread::sleep_for(std::chrono::milliseconds(30));
+            }
+            worker.join();
+            if (worker_ex) {
+                try { std::rethrow_exception(worker_ex); }
+                catch (const std::exception &e) { BOOST_LOG_TRIVIAL(error) << "boolean paint transfer skipped: " << e.what(); }
+                catch (...) { BOOST_LOG_TRIVIAL(error) << "boolean paint transfer skipped: unknown error"; }
+            }
         }
     }
 

@@ -11,6 +11,7 @@
 #include "TriangleMeshSlicer.hpp"
 #include "TriangleSelector.hpp"
 #include "AABBTreeIndirect.hpp"
+#include <atomic>
 #include <queue>
 
 #include "Format/AMF.hpp"
@@ -3428,19 +3429,19 @@ void ModelVolume::reproject_paint_from_volumes(const std::vector<std::pair<const
     // heavily-painted boundary will produce a lot of triangles - watch transfer time).
     const float edge_limit = 0.05f;
     // Spread the progress bar evenly across the layers we actually run.
-    const int active_layers = 1 + (any_sup ? 1 : 0) + (any_seam ? 1 : 0) + (any_fuzzy ? 1 : 0);
-    int       layer_ord     = 0;
-    bool      cancelled     = false;
+    const int         active_layers = 1 + (any_sup ? 1 : 0) + (any_seam ? 1 : 0) + (any_fuzzy ? 1 : 0);
+    int               layer_ord     = 0;
+    std::atomic<bool> cancelled{false}; // set from worker threads inside paint_by_sampler
     // Face adjacency of the union, for despeckling isolated mis-matched faces after transfer.
     const std::vector<Vec3i> union_neighbors = its_face_neighbors(this->mesh().its);
     auto apply = [&](Layer layer, FacetsAnnotation &dst) {
-        if (cancelled) { dst.reset(); return; }
+        if (cancelled.load()) { dst.reset(); return; }
         const int base = layer_ord++;
         TriangleSelector sel(this->mesh());
         sel.paint_by_sampler([&, layer](const Vec3f &p) { return sample(p, layer); }, edge_limit,
             [&, base](int done, int total) -> bool {
                 if (progress && total > 0 && !progress((base * 100 + done * 100 / total) / active_layers)) {
-                    cancelled = true;
+                    cancelled.store(true);
                     return false; // stop this layer's sampling
                 }
                 return true;
