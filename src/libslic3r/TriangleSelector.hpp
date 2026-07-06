@@ -281,13 +281,6 @@ public:
     void paint_by_sampler(const std::function<EnforcerBlockerType(const Vec3f &)> &sampler, float edge_limit,
                           const std::function<bool(int, int)> &progress = {});
 
-    // Remove isolated single-face colour specks: any original (unsplit) face whose state
-    // matches NONE of its unsplit neighbours is flipped to the dominant neighbour state.
-    // Subdivided faces (real painted detail / colour boundaries) are left untouched. Used to
-    // clean up salt-and-pepper mis-matches from nearest-surface paint transfer.
-    // `face_neighbors` is its_face_neighbors(mesh.its) for this selector's mesh.
-    void despeckle(const std::vector<Vec3i> &face_neighbors);
-
     // Clear everything and make the tree empty.
     void reset();
 

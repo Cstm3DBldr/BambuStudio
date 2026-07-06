@@ -3431,8 +3431,6 @@ void ModelVolume::reproject_paint_from_volumes(const std::vector<std::pair<const
     const int         active_layers = 1 + (any_sup ? 1 : 0) + (any_seam ? 1 : 0) + (any_fuzzy ? 1 : 0);
     int               layer_ord     = 0;
     std::atomic<bool> cancelled{false}; // set from worker threads inside paint_by_sampler
-    // Face adjacency of the union, for despeckling isolated mis-matched faces after transfer.
-    const std::vector<Vec3i> union_neighbors = its_face_neighbors(this->mesh().its);
     auto apply = [&](Layer layer, FacetsAnnotation &dst) {
         if (cancelled.load()) { dst.reset(); return; }
         const int base = layer_ord++;
@@ -3445,9 +3443,6 @@ void ModelVolume::reproject_paint_from_volumes(const std::vector<std::pair<const
                 }
                 return true;
             });
-        // Kill isolated single-face colour specks (nearest-surface mismatches where two source
-        // surfaces overlap), leaving real painted regions and boundaries intact.
-        sel.despeckle(union_neighbors);
         dst.reset();
         dst.set(sel);
     };
