@@ -1029,6 +1029,58 @@ void TriangleSelector::paint_by_sampler(const std::function<EnforcerBlockerType(
     this->garbage_collect();
 }
 
+void TriangleSelector::despeckle(const std::vector<Vec3i> &face_neighbors)
+{
+    // Dominant leaf state of an original face's subtree (most common leaf state, by leaf count).
+    auto dominant_of = [this](int root) -> EnforcerBlockerType {
+        std::map<int, int> counts;
+        std::queue<int> q;
+        q.push(root);
+        while (!q.empty()) {
+            const int i = q.front(); q.pop();
+            if (i < 0 || i >= int(m_triangles.size())) continue;
+            const Triangle &t = m_triangles[i];
+            if (!t.valid()) continue;
+            if (!t.is_split()) ++counts[int(t.get_state())];
+            else for (int c : t.children) if (c >= 0 && c < int(m_triangles.size())) q.push(c);
+        }
+        int best = int(EnforcerBlockerType::NONE), bc = 0;
+        for (const auto &kv : counts) if (kv.second > bc) { bc = kv.second; best = kv.first; }
+        return EnforcerBlockerType(best);
+    };
+
+    // Per-original-face dominant colour (computed up front so all decisions use pre-flip state).
+    const int n = std::min(m_orig_size_indices, (int)face_neighbors.size());
+    std::vector<EnforcerBlockerType> dom(m_orig_size_indices, EnforcerBlockerType::NONE);
+    for (int i = 0; i < m_orig_size_indices; ++i)
+        if (m_triangles[i].valid())
+            dom[i] = dominant_of(i);
+
+    // An original face whose dominant colour matches NONE of its neighbours' dominant colours is
+    // an isolated speck -> flip it (uniform) to the neighbours' majority. A real region or colour
+    // boundary always shares its dominant with at least one neighbour, so it is left intact.
+    std::vector<std::pair<int, EnforcerBlockerType>> flips;
+    for (int i = 0; i < n; ++i) {
+        if (!m_triangles[i].valid()) continue;
+        const EnforcerBlockerType s = dom[i];
+        std::map<int, int> counts;
+        bool matches_neighbor = false;
+        for (int e = 0; e < 3; ++e) {
+            const int j = face_neighbors[i][e];
+            if (j < 0 || j >= m_orig_size_indices || !m_triangles[j].valid()) continue;
+            ++counts[int(dom[j])];
+            if (dom[j] == s) matches_neighbor = true;
+        }
+        if (matches_neighbor || counts.empty()) continue;
+        int best_state = int(s), best_count = 0;
+        for (const auto &kv : counts)
+            if (kv.second > best_count) { best_count = kv.second; best_state = kv.first; }
+        flips.emplace_back(i, EnforcerBlockerType(best_state));
+    }
+    for (const auto &f : flips)
+        this->set_facet(f.first, f.second); // undivides + sets the whole face to one state
+}
+
 void TriangleSelector::paint_triangle_by_sampler(int facet_idx, const Vec3i &neighbors,
                                                  const std::function<EnforcerBlockerType(const Vec3f &)> &sampler,
                                                  int depth)

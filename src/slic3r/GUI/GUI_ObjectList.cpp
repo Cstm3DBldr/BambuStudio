@@ -3440,6 +3440,18 @@ void ObjectList::boolean()
     ModelObject* object = (*m_objects)[obj_idxs.front()];
     TriangleMesh mesh = Plater::combine_mesh_fff(*object, -1, [this](const std::string &msg) { return wxGetApp().notification_manager()->push_plater_warning_notification(msg); });
 
+    // Clean mcut's output before painting. When a source self-intersects, mcut resolves the
+    // CSG but can hand back coincident/duplicate vertices and degenerate sliver faces that
+    // z-fight and speckle the surface. Weld coincident vertices and drop degenerate faces so
+    // the paint lands on clean geometry. (Purely local vertex/face cleanup - it does not move
+    // any surface, so the paint transfer still matches the sources correctly.)
+    if (!mesh.its.indices.empty()) {
+        indexed_triangle_set its = std::move(mesh.its);
+        its_merge_vertices(its);
+        its_remove_degenerate_faces(its);
+        mesh = TriangleMesh(std::move(its));
+    }
+
     progress_dlg.Update(55, bool_msg + _L("Transferring paint..."));
 
     // add mesh to model as a new object, keep the original object's name and config

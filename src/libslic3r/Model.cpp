@@ -3422,13 +3422,16 @@ void ModelVolume::reproject_paint_from_volumes(const std::vector<std::pair<const
         return st;
     };
 
-    // 0.2 mm matches the finest edge the brush itself paints, so even thin brush strokes
-    // survive; uniform regions stay a single triangle so the mesh does not bloat.
-    const float edge_limit = 0.2f;
+    // Finer than the brush's own 0.2mm: subdivide colour boundaries down to 0.1mm so the
+    // stair-stepping is well below the nozzle/line width and the sliced colour edge comes out
+    // smooth. Only boundary faces subdivide, so uniform regions stay cheap.
+    const float edge_limit = 0.1f;
     // Spread the progress bar evenly across the layers we actually run.
     const int active_layers = 1 + (any_sup ? 1 : 0) + (any_seam ? 1 : 0) + (any_fuzzy ? 1 : 0);
     int       layer_ord     = 0;
     bool      cancelled     = false;
+    // Face adjacency of the union, for despeckling isolated mis-matched faces after transfer.
+    const std::vector<Vec3i> union_neighbors = its_face_neighbors(this->mesh().its);
     auto apply = [&](Layer layer, FacetsAnnotation &dst) {
         if (cancelled) { dst.reset(); return; }
         const int base = layer_ord++;
@@ -3441,6 +3444,9 @@ void ModelVolume::reproject_paint_from_volumes(const std::vector<std::pair<const
                 }
                 return true;
             });
+        // Kill isolated single-face colour specks (nearest-surface mismatches where two source
+        // surfaces overlap), leaving real painted regions and boundaries intact.
+        sel.despeckle(union_neighbors);
         dst.reset();
         dst.set(sel);
     };
