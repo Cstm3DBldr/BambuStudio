@@ -321,6 +321,7 @@ public:
     void                layers_editing();
 
     void                boolean();    // BBS: Boolean Operation of parts
+    void                refine_paint(); // smooth coarse mmu paint boundaries on the selected object (test trigger for the slicer refine)
     wxDataViewItem      add_layer_root_item(const wxDataViewItem obj_item);
     wxDataViewItem      add_settings_item(wxDataViewItem parent_item, const DynamicPrintConfig* config);
 

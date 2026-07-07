@@ -3685,6 +3685,73 @@ bool ObjectList::can_merge_to_single_object() const
     return (*m_objects)[obj_idx]->volumes.size() > 1;
 }
 
+// Test trigger for the slicer paint-refine: smooth the coarse mmu colour boundaries on the
+// selected object's painted parts and rebuild the scene so the result is visible in the editor.
+// (Local-frame refine at a fixed fineness; the slice-time version will map the target to
+// print-space. Undoable via the snapshot.)
+void ObjectList::refine_paint()
+{
+    const int obj_idx = get_selected_obj_idx();
+    if (obj_idx < 0 || obj_idx >= int(m_objects->size()))
+        return;
+
+    ModelObject *mo = (*m_objects)[obj_idx];
+    std::vector<ModelVolume*> vols;
+    for (ModelVolume *mv : mo->volumes)
+        if (mv->is_model_part() && !mv->mmu_segmentation_facets.empty())
+            vols.push_back(mv);
+    if (vols.empty())
+        return;
+
+    Plater::TakeSnapshot snapshot(wxGetApp().plater(), "Refine paint boundary");
+
+    // Progress popup matching the Boolean / repair dialog (same flags + adaptive sizing + two-line
+    // message) so the re-subdivision does not look like a silent freeze. The work runs on a
+    // background thread; the UI thread polls atomics and pumps the message queue (stays responsive).
+    const wxString msg = _L("Refine paint boundary") + ": " + from_u8(mo->name) + "\n";
+    ProgressDialog progress_dlg(_L("Refine paint boundary"), msg + _L("Smoothing paint boundaries..."), 100,
+                                find_toplevel_parent(wxGetApp().plater()),
+                                wxPD_AUTO_HIDE | wxPD_APP_MODAL | wxPD_CAN_ABORT, true);
+    progress_dlg.Update(1, msg + _L("Smoothing paint boundaries..."));
+
+    const int          nvol = int(vols.size());
+    std::atomic<int>   pct{0};
+    std::atomic<int>   vol_done{0};
+    std::atomic<bool>  cancel_req{false};
+    std::atomic<bool>  finished{false};
+    std::exception_ptr worker_ex;
+    std::thread worker([&]() {
+        try {
+            for (int i = 0; i < nvol; ++i) {
+                if (cancel_req.load(std::memory_order_relaxed)) break;
+                vols[i]->refine_paint_boundary(0.3f, 0.5f, [&pct, &cancel_req](int p) {
+                    pct.store(p, std::memory_order_relaxed);
+                    return !cancel_req.load(std::memory_order_relaxed);
+                });
+                vol_done.store(i + 1, std::memory_order_relaxed);
+                pct.store(0, std::memory_order_relaxed);
+            }
+        } catch (...) { worker_ex = std::current_exception(); }
+        finished.store(true, std::memory_order_release);
+    });
+    while (!finished.load(std::memory_order_acquire)) {
+        const int overall = (vol_done.load(std::memory_order_relaxed) * 100 + pct.load(std::memory_order_relaxed)) / nvol;
+        if (!progress_dlg.Update(std::max(1, std::min(99, overall)), msg + _L("Smoothing paint boundaries...")))
+            cancel_req.store(true, std::memory_order_relaxed);
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    }
+    worker.join();
+    if (worker_ex) {
+        try { std::rethrow_exception(worker_ex); }
+        catch (const std::exception &e) { BOOST_LOG_TRIVIAL(error) << "refine paint skipped: " << e.what(); }
+        catch (...) { BOOST_LOG_TRIVIAL(error) << "refine paint skipped: unknown error"; }
+    }
+
+    progress_dlg.Update(100, msg + _L("Updating scene..."));
+    wxGetApp().plater()->get_view3D_canvas3D()->reload_scene(true, true);
+    wxGetApp().plater()->update();
+}
+
 bool ObjectList::can_mesh_boolean() const
 {
     int obj_idx = get_selected_obj_idx();

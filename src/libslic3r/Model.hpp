@@ -993,7 +993,10 @@ public:
     // (repair/simplify/smooth). Replaces the mesh, then re-projects all four
     // paint layers from the OLD mesh onto the new one by nearest-surface lookup.
     // Approximate: a remeshed surface has no exact face correspondence.
-    void                set_mesh_keep_paint(TriangleMesh &&mesh);
+    // Rebuild the mesh (Simplify / Repair) while transferring painted color / supports / seam /
+    // fuzzy-skin to it at full fidelity. `progress(percent 0..100)`, if set, is called during the
+    // (multi-core) re-subdivision so the caller can drive a progress bar; return false to cancel.
+    void                set_mesh_keep_paint(TriangleMesh &&mesh, const std::function<bool(int)> &progress = {});
     // BBS: best-effort copy of all paint layers from src onto this volume's
     // current mesh by nearest-surface lookup (used for boolean results).
     void                reproject_paint_from(const ModelVolume &src);
@@ -1005,6 +1008,15 @@ public:
     // the (best-effort) transfer early.
     void                reproject_paint_from_volumes(const std::vector<std::pair<const ModelVolume*, Transform3d>> &srcs,
                                                      const std::function<bool(int)> &progress = {});
+    // Paint-refine (steps 2-3): smooth the mmu colour boundary (corner-preserving) and
+    // re-subdivide the paint to follow it, so coarse / scaled-up paint slices crisp instead of
+    // as a staircase. Operates in this volume's local frame. `target_mm` = boundary subdivision
+    // fineness; `corner_cos` = cos of the straight-through measure below which a boundary vertex
+    // is a real corner and is pinned (e.g. cos(60 deg)=0.5). Mutates mmu_segmentation_facets.
+    // `progress(percent 0..100)` is called during the (multi-core) re-subdivision so the caller
+    // can drive a progress bar; return false from it to cancel. Returns false if cancelled (the
+    // paint is then left unchanged), true otherwise.
+    bool                refine_paint_boundary(float target_mm, float corner_cos, const std::function<bool(int)> &progress = {});
     ModelMaterial*      material() const;
     void                set_material(t_model_material_id material_id, const ModelMaterial &material);
     // Extract the current extruder ID based on this ModelVolume's config and the parent ModelObject's config.

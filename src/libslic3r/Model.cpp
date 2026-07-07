@@ -3296,19 +3296,72 @@ static void reproj_transfer(const TriangleMesh &old_mesh, const TriangleMesh &ne
     reproj_apply_states(new_mesh, n_fuzzy, d_fuzzy);
 }
 
-void ModelVolume::set_mesh_keep_paint(TriangleMesh &&mesh_in)
+void ModelVolume::set_mesh_keep_paint(TriangleMesh &&mesh_in, const std::function<bool(int)> &progress)
 {
+    // High-fidelity paint preservation across a mesh rebuild (Simplify / Repair). The old path
+    // flattened every source face to ONE dominant colour, so a subdivided (brush-painted) boundary
+    // was destroyed when the mesh was rebuilt. Here we keep the FULL split-tree of the old mesh,
+    // sample it per-point by nearest surface, and drive the new mesh's own TriangleSelector to
+    // subdivide only where the colour changes - the same proven technique as the boolean transfer
+    // (reproject_paint_from_volumes), just single-source and same-frame (identity), so simpler.
     const TriangleMesh old_mesh = this->mesh(); // copy before replacing
-    std::vector<EnforcerBlockerType> o_sup, o_seam, o_mmu, o_fuzzy;
-    reproj_per_face_states(old_mesh, this->supported_facets,        o_sup);
-    reproj_per_face_states(old_mesh, this->seam_facets,             o_seam);
-    reproj_per_face_states(old_mesh, this->mmu_segmentation_facets, o_mmu);
-    reproj_per_face_states(old_mesh, this->fuzzy_skin_facets,       o_fuzzy);
+
+    auto make_sel = [&old_mesh](const FacetsAnnotation &ann) -> std::shared_ptr<TriangleSelector> {
+        if (ann.empty()) return nullptr;
+        auto s = std::make_shared<TriangleSelector>(old_mesh);
+        s->deserialize(ann.get_data(), true);
+        return s;
+    };
+    auto sel_mmu   = make_sel(this->mmu_segmentation_facets);
+    auto sel_sup   = make_sel(this->supported_facets);
+    auto sel_seam  = make_sel(this->seam_facets);
+    auto sel_fuzzy = make_sel(this->fuzzy_skin_facets);
+
     this->set_mesh(std::move(mesh_in));
-    // Repair / Simplify barely change the mesh -> exact nearest-face transfer, no paint bleed.
-    reproj_transfer(old_mesh, this->mesh(), o_sup, o_seam, o_mmu, o_fuzzy,
-                    this->supported_facets, this->seam_facets,
-                    this->mmu_segmentation_facets, this->fuzzy_skin_facets, /*exact=*/true);
+
+    if (old_mesh.its.indices.empty() || this->mesh().its.indices.empty() ||
+        (!sel_mmu && !sel_sup && !sel_seam && !sel_fuzzy)) {
+        this->supported_facets.reset();        this->seam_facets.reset();
+        this->mmu_segmentation_facets.reset(); this->fuzzy_skin_facets.reset();
+        return;
+    }
+
+    auto tree = AABBTreeIndirect::build_aabb_tree_over_indexed_triangle_set(
+        old_mesh.its.vertices, old_mesh.its.indices);
+
+    // Subdivide colour boundaries down to 0.05mm - below the smallest printable layer height, so the
+    // paint boundary survives the remesh at full fidelity instead of being flattened to base faces.
+    const float edge_limit = 0.05f;
+    // Spread the progress bar across only the layers we actually transfer (most models = mmu only).
+    const int         active = (sel_mmu ? 1 : 0) + (sel_sup ? 1 : 0) + (sel_seam ? 1 : 0) + (sel_fuzzy ? 1 : 0);
+    int               ord    = 0;
+    std::atomic<bool> cancelled{false};
+    auto transfer = [&](const std::shared_ptr<TriangleSelector> &src, FacetsAnnotation &dst) {
+        if (!src || cancelled.load()) { dst.reset(); return; }
+        const int base = ord++;
+        TriangleSelector out(this->mesh());
+        out.paint_by_sampler([&](const Vec3f &p) -> EnforcerBlockerType {
+            size_t face = size_t(-1); Vec3f hit;
+            const double d2 = AABBTreeIndirect::squared_distance_to_indexed_triangle_set(
+                old_mesh.its.vertices, old_mesh.its.indices, tree, p, face, hit);
+            if (d2 < 0. || face == size_t(-1)) return EnforcerBlockerType::NONE;
+            return src->state_at(hit, int(face));
+        }, edge_limit,
+            [&, base](int done, int total) -> bool {
+                if (progress && total > 0 && !progress((base * 100 + done * 100 / total) / std::max(1, active))) {
+                    cancelled.store(true);
+                    return false;
+                }
+                return true;
+            });
+        dst.reset();
+        dst.set(out);
+    };
+    transfer(sel_mmu,   this->mmu_segmentation_facets);
+    transfer(sel_sup,   this->supported_facets);
+    transfer(sel_seam,  this->seam_facets);
+    transfer(sel_fuzzy, this->fuzzy_skin_facets);
+    if (progress) progress(100);
 }
 
 void ModelVolume::reproject_paint_from(const ModelVolume &src)
@@ -3455,6 +3508,158 @@ void ModelVolume::reproject_paint_from_volumes(const std::vector<std::pair<const
     if (progress) progress(100);
 }
 // ------------------------------------------------------------------------------
+
+bool ModelVolume::refine_paint_boundary(float target_mm, float corner_cos, const std::function<bool(int)> &progress)
+{
+    const indexed_triangle_set &its = this->mesh().its;
+    const int nF = int(its.indices.size());
+    const int nV = int(its.vertices.size());
+    if (nF == 0 || this->mmu_segmentation_facets.empty())
+        return true;
+
+    // Per-base-face paint colour + centroids.
+    TriangleSelector src(this->mesh());
+    src.deserialize(this->mmu_segmentation_facets.get_data(), true);
+    std::vector<int>   face_color(nF, 0);
+    std::vector<Vec3f> cen(nF);
+    for (int i = 0; i < nF; ++i) {
+        const Vec3i &f = its.indices[i];
+        cen[i]        = (its.vertices[f(0)] + its.vertices[f(1)] + its.vertices[f(2)]) / 3.f;
+        face_color[i] = int(src.state_at(cen[i], i));
+    }
+
+    // Colour-boundary edges. Each stores its endpoints, the two colours it separates (A<B), and
+    // cenA = centroid of the A-coloured face (a point reliably on the A side). vedges[v] lists the
+    // boundary edges at vertex v (its boundary neighbours), used to walk the boundary in order.
+    const std::vector<Vec3i>      nb = its_face_neighbors(its);
+    struct BEdge { int v0, v1, A, B; Vec3f cenA; };
+    std::vector<BEdge>            edges;
+    std::vector<std::vector<int>> vedges(nV);
+    double sumlen = 0.;
+    for (int i = 0; i < nF; ++i) {
+        const Vec3i &fi = its.indices[i];
+        for (int e = 0; e < 3; ++e) {
+            const int j = nb[i][e];
+            if (j <= i || face_color[i] == face_color[j]) continue;
+            const Vec3i &fj = its.indices[j];
+            int sh[2], n = 0;
+            for (int a = 0; a < 3 && n < 2; ++a)
+                for (int b = 0; b < 3; ++b)
+                    if (fi(a) == fj(b)) { sh[n++] = fi(a); break; }
+            if (n != 2) continue;
+            const int A = std::min(face_color[i], face_color[j]);
+            const int B = std::max(face_color[i], face_color[j]);
+            const int faceA = (face_color[i] == A) ? i : j;
+            edges.push_back(BEdge{ sh[0], sh[1], A, B, cen[faceA] });
+            const int ei = int(edges.size()) - 1;
+            vedges[sh[0]].push_back(ei);
+            vedges[sh[1]].push_back(ei);
+            sumlen += (its.vertices[sh[0]] - its.vertices[sh[1]]).norm();
+        }
+    }
+    if (edges.empty())
+        return true;
+    const double avglen = sumlen / double(edges.size());
+
+    auto tree = AABBTreeIndirect::build_aabb_tree_over_indexed_triangle_set(its.vertices, its.indices);
+
+    // Smooth the boundary vertices by fitting a local line (mean + window-span direction over an
+    // ordered window walked along the boundary) and projecting the vertex onto it. That straightens
+    // the triangle staircase without eroding features (unlike a blur) or oscillating (unlike a plain
+    // Laplacian). Junctions (deg != 2) and sharp corners are pinned so real corners survive.
+    auto other = [&](int ei, int v) -> int { return edges[ei].v0 == v ? edges[ei].v1 : edges[ei].v0; };
+    auto walk  = [&](int start, int came_from, int steps, std::vector<int> &out) {
+        int cur = start, prev = came_from;
+        for (int s = 0; s < steps; ++s) {
+            if (int(vedges[cur].size()) != 2) break;
+            int nx = -1;
+            for (int ei : vedges[cur]) { const int o = other(ei, cur); if (o != prev) { nx = o; break; } }
+            if (nx < 0) break;
+            out.push_back(nx); prev = cur; cur = nx;
+        }
+    };
+    const int W = 4;
+    std::vector<Vec3f> pos(its.vertices);
+    for (int pass = 0; pass < 2; ++pass) {
+        std::vector<Vec3f> np = pos;
+        for (int v = 0; v < nV; ++v) {
+            if (int(vedges[v].size()) != 2) continue; // pin endpoints / junctions
+            const int a0 = other(vedges[v][0], v), b0 = other(vedges[v][1], v);
+            if ((-(pos[a0] - pos[v]).normalized()).dot((pos[b0] - pos[v]).normalized()) < corner_cos)
+                continue; // sharper than the keep-corner angle -> pin
+            std::vector<int> armA; armA.push_back(a0); walk(a0, v, W - 1, armA);
+            std::vector<int> armB; armB.push_back(b0); walk(b0, v, W - 1, armB);
+            Vec3f mean = pos[v]; int cnt = 1;
+            for (int u : armA) { mean += pos[u]; ++cnt; }
+            for (int u : armB) { mean += pos[u]; ++cnt; }
+            mean /= float(cnt);
+            Vec3f dir = pos[armA.back()] - pos[armB.back()];
+            if (dir.squaredNorm() < 1e-12f) continue;
+            dir.normalize();
+            const Vec3f proj = mean + dir * ((pos[v] - mean).dot(dir));
+            size_t face = size_t(-1); Vec3f hit;
+            const double d2 = AABBTreeIndirect::squared_distance_to_indexed_triangle_set(
+                its.vertices, its.indices, tree, proj, face, hit);
+            np[v] = (d2 >= 0.) ? hit : proj;
+        }
+        pos.swap(np);
+    }
+
+    // Build an AABB over the smoothed boundary segments (as degenerate triangles) so the recolour
+    // can find the nearest segment in log time instead of scanning every edge per sample.
+    indexed_triangle_set seg_its;
+    seg_its.vertices.reserve(edges.size() * 2);
+    seg_its.indices.reserve(edges.size());
+    for (size_t k = 0; k < edges.size(); ++k) {
+        seg_its.vertices.push_back(pos[edges[k].v0]);
+        seg_its.vertices.push_back(pos[edges[k].v1]);
+        seg_its.indices.push_back(Vec3i(int(2 * k), int(2 * k + 1), int(2 * k)));
+    }
+    auto seg_tree = AABBTreeIndirect::build_aabb_tree_over_indexed_triangle_set(seg_its.vertices, seg_its.indices);
+
+    // Recolour: beyond ~a staircase width from every boundary segment a point keeps its original
+    // region colour; otherwise its colour is decided by which side of the nearest SMOOTHED segment
+    // it lies, measured against that segment's A-side reference centroid (cenA). Comparing to cenA
+    // instead of a surface normal makes the side test independent of normal orientation - that was
+    // the wrong-side bug that broke earlier attempts. Driven through paint_by_sampler.
+    const double band2 = (1.6 * avglen) * (1.6 * avglen);
+    auto sample = [&](const Vec3f &p) -> EnforcerBlockerType {
+        size_t face = size_t(-1); Vec3f fhit;
+        const double dorig = AABBTreeIndirect::squared_distance_to_indexed_triangle_set(
+            its.vertices, its.indices, tree, p, face, fhit);
+        const int origc = (dorig >= 0. && face != size_t(-1)) ? face_color[int(face)] : int(EnforcerBlockerType::NONE);
+
+        size_t seg = size_t(-1); Vec3f bcp;
+        const double dseg = AABBTreeIndirect::squared_distance_to_indexed_triangle_set(
+            seg_its.vertices, seg_its.indices, seg_tree, p, seg, bcp);
+        if (seg == size_t(-1) || dseg < 0. || dseg > band2)
+            return EnforcerBlockerType(origc);
+
+        const BEdge &ed = edges[int(seg)];
+        Vec3f dh = pos[ed.v1] - pos[ed.v0];
+        if (dh.squaredNorm() < 1e-12f) return EnforcerBlockerType(origc);
+        dh.normalize();
+        const Vec3f perpP = (p       - bcp) - ((p       - bcp).dot(dh)) * dh;
+        const Vec3f perpA = (ed.cenA - bcp) - ((ed.cenA - bcp).dot(dh)) * dh;
+        return EnforcerBlockerType(perpP.dot(perpA) >= 0.f ? ed.A : ed.B);
+    };
+
+    std::atomic<bool> cancelled{false};
+    TriangleSelector  out(this->mesh());
+    out.paint_by_sampler([&](const Vec3f &p) { return sample(p); }, target_mm,
+        [&](int done, int total) -> bool {
+            if (progress && total > 0 && !progress(std::min(100, done * 100 / total))) {
+                cancelled.store(true);
+                return false;
+            }
+            return true;
+        });
+    if (cancelled.load())
+        return false; // leave the paint unchanged
+    this->mmu_segmentation_facets.reset();
+    this->mmu_segmentation_facets.set(out);
+    return true;
+}
 
 ModelMaterial* ModelVolume::material() const
 {

@@ -1275,6 +1275,11 @@ void MenuFactory::create_bbl_object_menu()
     append_menu_item_smooth_mesh(&m_object_menu);
     // merge to single part
     append_menu_item_merge_parts_to_single_part(&m_object_menu);
+    // Refine paint boundary (test trigger for the slicer paint-refine)
+    append_menu_item(&m_object_menu, wxID_ANY, _L("Refine paint boundary"),
+        _L("Smooth coarse painted colour boundaries so they slice crisp"),
+        [](wxCommandEvent&) { obj_list()->refine_paint(); }, "", &m_object_menu,
+        []() { return true; }, m_parent);
     //scale_selection_to_fit_print_volume
     append_menu_item_scale_selection_to_fit_print_volume(&m_object_menu);
     // Object Center
