@@ -1008,15 +1008,6 @@ public:
     // the (best-effort) transfer early.
     void                reproject_paint_from_volumes(const std::vector<std::pair<const ModelVolume*, Transform3d>> &srcs,
                                                      const std::function<bool(int)> &progress = {});
-    // Paint-refine (steps 2-3): smooth the mmu colour boundary (corner-preserving) and
-    // re-subdivide the paint to follow it, so coarse / scaled-up paint slices crisp instead of
-    // as a staircase. Operates in this volume's local frame. `target_mm` = boundary subdivision
-    // fineness; `corner_cos` = cos of the straight-through measure below which a boundary vertex
-    // is a real corner and is pinned (e.g. cos(60 deg)=0.5). Mutates mmu_segmentation_facets.
-    // `progress(percent 0..100)` is called during the (multi-core) re-subdivision so the caller
-    // can drive a progress bar; return false from it to cancel. Returns false if cancelled (the
-    // paint is then left unchanged), true otherwise.
-    bool                refine_paint_boundary(float target_mm, float corner_cos, const std::function<bool(int)> &progress = {});
     ModelMaterial*      material() const;
     void                set_material(t_model_material_id material_id, const ModelMaterial &material);
     // Extract the current extruder ID based on this ModelVolume's config and the parent ModelObject's config.
